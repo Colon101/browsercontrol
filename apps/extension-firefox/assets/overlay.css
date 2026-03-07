@@ -1,0 +1,495 @@
+.bc-shell,
+.bc-shell * {
+  box-sizing: border-box;
+}
+
+.bc-shell {
+  --bc-bg: linear-gradient(180deg, #f6f1e7 0%, #efe6d5 100%);
+  --bc-card: rgba(255, 250, 242, 0.98);
+  --bc-border: rgba(58, 43, 28, 0.14);
+  --bc-shadow: 0 18px 60px rgba(40, 27, 13, 0.22);
+  --bc-text: #23180f;
+  --bc-muted: #6f604f;
+  --bc-accent: #0d6b5f;
+  --bc-accent-soft: rgba(13, 107, 95, 0.12);
+  --bc-warning: #9c4a12;
+  --bc-warning-soft: rgba(156, 74, 18, 0.12);
+  --bc-danger: #8e1f24;
+  --bc-danger-soft: rgba(142, 31, 36, 0.12);
+  --bc-tool: #1e4c78;
+  --bc-tool-soft: rgba(30, 76, 120, 0.12);
+  color: var(--bc-text);
+  direction: ltr;
+  font-family: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+}
+
+.bc-card {
+  position: fixed;
+  min-width: 320px;
+  min-height: 360px;
+  max-width: min(520px, 45vw);
+  max-height: min(760px, 88vh);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--bc-border);
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at top right, rgba(13, 107, 95, 0.16), transparent 30%),
+    radial-gradient(circle at bottom left, rgba(161, 98, 7, 0.12), transparent 28%),
+    var(--bc-bg);
+  box-shadow: var(--bc-shadow);
+  backdrop-filter: blur(22px);
+  overflow: hidden;
+}
+
+.bc-card[data-access-mode="take_control"] {
+  border-color: rgba(73, 148, 255, 0.3);
+  box-shadow: 0 22px 80px rgba(49, 111, 214, 0.22);
+}
+
+.bc-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: grab;
+  user-select: none;
+}
+
+.bc-header:active {
+  cursor: grabbing;
+}
+
+.bc-header-copy {
+  min-width: 0;
+}
+
+.bc-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bc-brand-mark {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: #173a52;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  flex: 0 0 auto;
+}
+
+.bc-brand-icon {
+  width: 19px;
+  height: 19px;
+  display: block;
+  color: #ffffff;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  overflow: visible;
+}
+
+.bc-title-stack {
+  min-width: 0;
+}
+
+.bc-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bc-title {
+  margin: 0;
+  font-family: "Avenir Next", "IBM Plex Sans", sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.bc-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(35, 24, 15, 0.07);
+  color: var(--bc-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.bc-pill-connection[data-state="online"] {
+  background: var(--bc-accent-soft);
+  color: var(--bc-accent);
+}
+
+.bc-pill-connection[data-state="offline"] {
+  background: var(--bc-danger-soft);
+  color: var(--bc-danger);
+}
+
+.bc-pill-task[data-state="running"],
+.bc-pill-task[data-state="starting"] {
+  background: var(--bc-tool-soft);
+  color: var(--bc-tool);
+}
+
+.bc-pill-task[data-state="paused"] {
+  background: rgba(114, 89, 40, 0.12);
+  color: #725928;
+}
+
+.bc-pill-task[data-state="completed"] {
+  background: var(--bc-accent-soft);
+  color: var(--bc-accent);
+}
+
+.bc-pill-task[data-state="error"] {
+  background: var(--bc-danger-soft);
+  color: var(--bc-danger);
+}
+
+.bc-header-message {
+  min-height: 18px;
+  margin-top: 6px;
+  color: var(--bc-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.bc-header-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.bc-icon-button,
+.bc-send-button,
+.bc-access-button,
+.bc-new-activity,
+.bc-field select,
+.bc-field input {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--bc-text);
+  font: inherit;
+}
+
+.bc-icon-button {
+  min-width: 74px;
+  padding: 8px 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bc-icon-button-compact {
+  display: inline-flex;
+  align-items: center;
+  min-width: 44px;
+  width: 44px;
+  padding: 0;
+  justify-content: center;
+}
+
+.bc-icon-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.bc-feed-wrap {
+  position: relative;
+  min-height: 0;
+}
+
+.bc-feed {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.bc-feed-item {
+  padding: 10px 12px;
+  border-radius: 16px;
+  background: var(--bc-card);
+  border: 1px solid rgba(35, 24, 15, 0.07);
+  box-shadow: 0 8px 24px rgba(41, 28, 15, 0.06);
+}
+
+.bc-feed-item-user {
+  align-self: flex-end;
+  background: rgba(13, 107, 95, 0.12);
+  border-color: rgba(13, 107, 95, 0.18);
+}
+
+.bc-feed-item-tool {
+  background: var(--bc-tool-soft);
+  border-color: rgba(30, 76, 120, 0.18);
+}
+
+.bc-feed-item-answer {
+  background: rgba(13, 107, 95, 0.1);
+  border-color: rgba(13, 107, 95, 0.22);
+  color: var(--bc-text);
+}
+
+.bc-feed-item-warning {
+  background: var(--bc-warning-soft);
+  border-color: rgba(156, 74, 18, 0.2);
+}
+
+.bc-feed-item-error {
+  background: var(--bc-danger-soft);
+  border-color: rgba(142, 31, 36, 0.2);
+}
+
+.bc-feed-item-header {
+  color: var(--bc-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.bc-feed-item-title,
+.bc-feed-item-body {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.bc-feed-item-title {
+  font-weight: 700;
+}
+
+.bc-feed-item-answer .bc-feed-item-header,
+.bc-feed-item-answer .bc-feed-item-title {
+  color: var(--bc-accent);
+}
+
+.bc-new-activity {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 6px 10px;
+  border-color: rgba(13, 107, 95, 0.18);
+  background: rgba(255, 250, 242, 0.96);
+  color: var(--bc-accent);
+  cursor: pointer;
+}
+
+.bc-composer {
+  display: block;
+}
+
+.bc-composer-inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.bc-composer textarea {
+  width: 100%;
+  min-height: 72px;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid rgba(35, 24, 15, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--bc-text);
+  font: inherit;
+  line-height: 1.45;
+  outline: none;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.bc-composer textarea:focus {
+  border-color: rgba(13, 107, 95, 0.32);
+  box-shadow: 0 0 0 3px rgba(13, 107, 95, 0.12);
+}
+
+.bc-send-button {
+  min-width: 96px;
+  min-height: 72px;
+  padding: 12px 18px;
+  align-self: stretch;
+  border-color: rgba(13, 107, 95, 0.2);
+  background: #0d6b5f;
+  color: #fff8ef;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.bc-send-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.bc-session-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(92px, 0.65fr) 76px;
+  gap: 8px;
+  align-items: end;
+  padding-top: 4px;
+}
+
+.bc-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bc-field > span {
+  color: var(--bc-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.bc-field select,
+.bc-field input {
+  width: 100%;
+  padding: 8px 10px;
+  border-color: rgba(35, 24, 15, 0.12);
+  outline: none;
+}
+
+.bc-access-button {
+  width: 52px;
+  min-height: 40px;
+  padding: 8px;
+  border-radius: 16px;
+  border-color: rgba(35, 24, 15, 0.12);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.bc-access-field {
+  justify-items: end;
+}
+
+.bc-inline-icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.85;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: 0 0 auto;
+}
+
+.bc-access-button[data-access-mode="readonly"] {
+  border-color: rgba(35, 24, 15, 0.12);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--bc-muted);
+}
+
+.bc-access-button[data-access-mode="take_control"] {
+  border-color: rgba(73, 148, 255, 0.3);
+  background: rgba(73, 148, 255, 0.16);
+  color: #2c7be5;
+}
+
+.bc-access-button[aria-pressed="true"] {
+  box-shadow: 0 0 0 1px rgba(73, 148, 255, 0.28), 0 0 18px rgba(73, 148, 255, 0.35);
+}
+
+.bc-resize-grip {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  background:
+    linear-gradient(135deg, transparent 0 36%, rgba(35, 24, 15, 0.18) 36% 42%, transparent 42% 58%, rgba(35, 24, 15, 0.18) 58% 64%, transparent 64%);
+  border-radius: 6px;
+}
+
+@media (max-width: 720px) {
+  .bc-card {
+    max-width: min(520px, calc(100vw - 16px));
+    max-height: min(760px, calc(100vh - 16px));
+  }
+
+  .bc-composer-inline {
+    grid-template-columns: 1fr;
+  }
+
+  .bc-send-button {
+    min-height: 48px;
+  }
+
+  .bc-session-bar {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .bc-shell {
+    --bc-bg: linear-gradient(180deg, #1f2329 0%, #171a1f 100%);
+    --bc-card: rgba(35, 39, 46, 0.94);
+    --bc-border: rgba(255, 255, 255, 0.08);
+    --bc-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+    --bc-text: #f1ebe0;
+    --bc-muted: #b5aa98;
+    --bc-accent-soft: rgba(102, 215, 193, 0.16);
+    --bc-danger-soft: rgba(255, 120, 120, 0.16);
+    --bc-tool-soft: rgba(113, 173, 255, 0.16);
+  }
+
+  .bc-feed-item-answer {
+    background: rgba(102, 215, 193, 0.1);
+    border-color: rgba(102, 215, 193, 0.2);
+  }
+
+  .bc-access-button[data-access-mode="readonly"] {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--bc-muted);
+  }
+
+  .bc-access-button[data-access-mode="take_control"] {
+    background: rgba(73, 148, 255, 0.18);
+    color: #8ec2ff;
+  }
+
+  .bc-brand-mark {
+    background: #0e6d80;
+  }
+
+  .bc-icon-button,
+  .bc-new-activity,
+  .bc-field select,
+  .bc-field input,
+  .bc-access-button,
+  .bc-composer textarea {
+    background: rgba(255, 255, 255, 0.06);
+  }
+}

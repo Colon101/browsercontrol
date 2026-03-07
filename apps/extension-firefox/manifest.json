@@ -1,0 +1,45 @@
+{
+  "manifest_version": 2,
+  "name": "BrowserControl",
+  "version": "0.1.0",
+  "description": "Local-first Codex-driven browser control for Firefox.",
+  "icons": {
+    "48": "icon-48.png",
+    "96": "icon-96.png",
+    "128": "icon-128.png"
+  },
+  "permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "tabs",
+    "activeTab",
+    "storage"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_title": "BrowserControl",
+    "default_icon": {
+      "16": "robot-toolbar-light.svg",
+      "32": "robot-toolbar-light.svg"
+    },
+    "theme_icons": [
+      {
+        "light": "robot-toolbar-light.svg",
+        "dark": "robot-toolbar-dark.svg",
+        "size": 16
+      },
+      {
+        "light": "robot-toolbar-light.svg",
+        "dark": "robot-toolbar-dark.svg",
+        "size": 32
+      }
+    ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "browsercontrol@example.local"
+    }
+  }
+}
