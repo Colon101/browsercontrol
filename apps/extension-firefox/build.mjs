@@ -13,9 +13,13 @@ await mkdir(dist, { recursive: true });
 await mkdir(buildDir, { recursive: true });
 
 await build({
-  entryPoints: [join(root, "src/background.ts"), join(root, "src/content.ts")],
+  entryPoints: {
+    background: join(root, "src/background-entry.ts"),
+    content: join(root, "src/content-entry.ts")
+  },
   bundle: true,
   outdir: dist,
+  entryNames: "[name]",
   platform: "browser",
   format: "iife",
   target: ["firefox128"],

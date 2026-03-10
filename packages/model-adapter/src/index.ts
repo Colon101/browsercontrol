@@ -1,24 +1,23 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { listToolSchemas } from "../../browser-tools/src/index.js";
+import { getToolArgSchema } from "../../browser-tools/src/index.js";
 import {
   DEFAULT_MODEL_DESCRIPTORS,
-  BrowserToolNameSchema,
   ModelIdSchema,
+  BrowserToolNameSchema,
+  createIncrementingId,
+  resolveEffectiveModelId,
+  type BrowserToolName,
+  type Effort,
   type ModelDescriptor,
-  type ModelId,
   type ModelTurn,
   type TaskSpec
 } from "../../shared/src/index.js";
 
 export type ModelAdapterEvent =
   | { type: "progress"; sessionId: string; summary: string; raw?: unknown }
-  | { type: "error"; sessionId: string; message: string }
-  | { type: "spawn"; sessionId: string; command: string[] };
+  | { type: "error"; sessionId: string; message: string };
 
 export interface ModelSessionConfig {
   sessionId: string;
@@ -29,7 +28,13 @@ export interface ModelSessionConfig {
 export interface ModelAdapter {
   listModels(): Promise<ModelDescriptor[]>;
   startSession(config: ModelSessionConfig): Promise<void>;
-  sendUserMessage(sessionId: string, message: string): Promise<ModelTurn>;
+  sendUserMessage(
+    sessionId: string,
+    message: string,
+    options?: {
+      imagePath?: string;
+    }
+  ): Promise<ModelTurn>;
   submitToolResult(
     sessionId: string,
     callId: string,
@@ -39,56 +44,85 @@ export interface ModelAdapter {
   onEvent(handler: (event: ModelAdapterEvent) => void): () => void;
 }
 
-type ConversationEntry =
-  | { role: "user"; content: string }
-  | { role: "tool"; callId: string; content: string };
+type ChatMessage =
+  | { role: "system"; content: string }
+  | {
+      role: "user";
+      content:
+        | string
+        | Array<
+            | { type: "text"; text: string }
+            | { type: "image_url"; image_url: { url: string } }
+          >;
+    }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    }
+  | {
+      role: "tool";
+      tool_call_id: string;
+      content: string;
+    };
 
-interface SessionState {
+interface ChatMockSessionState {
   config: ModelSessionConfig;
-  history: ConversationEntry[];
-  lastScreenshotPath?: string;
+  messages: ChatMessage[];
+  toolCallMap: Map<string, string>;
 }
 
-const outputSchema = {
-  type: "object",
-  required: ["kind", "summary", "callId", "toolName", "argsJson", "answer"],
-  additionalProperties: false,
-  properties: {
-    kind: {
-      type: "string",
-      enum: ["tool_call", "final"]
-    },
-    summary: {
-      type: "string"
-    },
-    callId: {
-      type: "string"
-    },
-    toolName: {
-      type: "string"
-    },
-    argsJson: {
-      type: "string"
-    },
-    answer: {
-      type: "string"
-    }
-  }
-};
-
-const rawModelTurnSchema = z.object({
-  kind: z.enum(["tool_call", "final"]),
-  summary: z.string(),
-  callId: z.string(),
-  toolName: z.string(),
-  argsJson: z.string(),
-  answer: z.string()
+const completionResponseSchema = z.object({
+  choices: z
+    .array(
+      z.object({
+        message: z.object({
+          content: z.union([z.string(), z.null()]).optional(),
+          tool_calls: z
+            .array(
+              z.object({
+                id: z.string(),
+                type: z.literal("function"),
+                function: z.object({
+                  name: z.string(),
+                  arguments: z.string()
+                })
+              })
+            )
+            .optional()
+        })
+      })
+    )
+    .min(1)
 });
 
-export class CodexCliAdapter implements ModelAdapter {
-  private sessions = new Map<string, SessionState>();
-  private events = new EventEmitter();
-  private running = new Map<string, ReturnType<typeof spawn>>();
+export class ChatMockModelAdapter implements ModelAdapter {
+  private readonly sessions = new Map<string, ChatMockSessionState>();
+  private readonly events = new EventEmitter();
+  private readonly baseUrl: string;
+  private readonly apiKey: string | null;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(options: { baseUrl?: string; apiKey?: string | null; fetchImpl?: typeof fetch } = {}) {
+    this.baseUrl =
+      (options.baseUrl ?? process.env.BROWSERCONTROL_CHATMOCK_BASE_URL ?? "http://127.0.0.1:8000").replace(/\/$/, "");
+    this.apiKey =
+      options.apiKey ??
+      process.env.BROWSERCONTROL_CHATMOCK_API_KEY ??
+      process.env.OPENAI_API_KEY ??
+      null;
+    this.fetchImpl =
+      options.fetchImpl ??
+      ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+        fetch(input, init));
+  }
 
   async listModels(): Promise<ModelDescriptor[]> {
     return DEFAULT_MODEL_DESCRIPTORS.map((model) => ({ ...model }));
@@ -97,14 +131,29 @@ export class CodexCliAdapter implements ModelAdapter {
   async startSession(config: ModelSessionConfig): Promise<void> {
     this.sessions.set(config.sessionId, {
       config,
-      history: []
+      messages: [
+        {
+          role: "system",
+          content: buildSystemPrompt()
+        }
+      ],
+      toolCallMap: new Map()
     });
   }
 
-  async sendUserMessage(sessionId: string, message: string): Promise<ModelTurn> {
+  async sendUserMessage(
+    sessionId: string,
+    message: string,
+    options?: {
+      imagePath?: string;
+    }
+  ): Promise<ModelTurn> {
     const session = this.requireSession(sessionId);
-    session.history.push({ role: "user", content: message });
-    return this.invokeTurn(session);
+    session.messages.push({
+      role: "user",
+      content: await buildUserContent(message, options?.imagePath)
+    });
+    return await this.complete(session);
   }
 
   async submitToolResult(
@@ -113,30 +162,16 @@ export class CodexCliAdapter implements ModelAdapter {
     result: unknown
   ): Promise<ModelTurn> {
     const session = this.requireSession(sessionId);
-    session.history.push({
+    const providerCallId = session.toolCallMap.get(callId) ?? callId;
+    session.messages.push({
       role: "tool",
-      callId,
-      content: JSON.stringify(result, null, 2)
+      tool_call_id: providerCallId,
+      content: JSON.stringify(result)
     });
-
-    if (
-      typeof result === "object" &&
-      result !== null &&
-      "artifactPath" in result &&
-      typeof result.artifactPath === "string"
-    ) {
-      session.lastScreenshotPath = result.artifactPath;
-    }
-
-    return this.invokeTurn(session);
+    return await this.complete(session);
   }
 
   async cancelSession(sessionId: string): Promise<void> {
-    const child = this.running.get(sessionId);
-    if (child) {
-      child.kill("SIGTERM");
-      this.running.delete(sessionId);
-    }
     this.sessions.delete(sessionId);
   }
 
@@ -153,224 +188,231 @@ export class CodexCliAdapter implements ModelAdapter {
     return session;
   }
 
-  private async invokeTurn(session: SessionState): Promise<ModelTurn> {
-    const tempDir = await mkdtemp(join(tmpdir(), "browsercontrol-codex-"));
-    const schemaPath = join(tempDir, "output.schema.json");
-    const outputPath = join(tempDir, "last-message.json");
-    await writeFile(schemaPath, JSON.stringify(outputSchema, null, 2), "utf8");
+  private async complete(session: ChatMockSessionState): Promise<ModelTurn> {
+    const model = resolveRequestedModel(
+      session.config.task.model,
+      session.config.task.effort
+    );
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {})
+      },
+      body: JSON.stringify({
+        model,
+        messages: session.messages,
+        tools: buildToolDefinitions(),
+        tool_choice: "auto",
+        stream: false
+      })
+    });
 
-    const args = [
-      "-y",
-      "@openai/codex",
-      "exec",
-      "--skip-git-repo-check",
-      "--ephemeral",
-      "--json",
-      "--color",
-      "never",
-      "--output-schema",
-      schemaPath,
-      "--output-last-message",
-      outputPath,
-      "-m",
-      this.resolveModel(session.config.task.model),
-      "-"
-    ];
-
-    if (session.lastScreenshotPath) {
-      args.splice(args.length - 1, 0, "-i", session.lastScreenshotPath);
+    if (!response.ok) {
+      const message = await response.text();
+      const error = `ChatMock request failed with ${response.status}: ${message || "empty response"}`;
+      this.emit({
+        type: "error",
+        sessionId: session.config.sessionId,
+        message: error
+      });
+      throw new Error(error);
     }
 
-    const prompt = this.buildPrompt(session);
+    const payload = completionResponseSchema.parse(await response.json());
+    const message = payload.choices[0]!.message;
+    const toolCall = message.tool_calls?.[0];
+    if (toolCall) {
+      session.messages.push({
+        role: "assistant",
+        content: message.content ?? null,
+        tool_calls: [toolCall]
+      });
+      const turn = parseToolCall(toolCall);
+      session.toolCallMap.set(turn.callId, toolCall.id);
+      this.emit({
+        type: "progress",
+        sessionId: session.config.sessionId,
+        summary: `${turn.toolName} ${JSON.stringify(turn.args)}`
+      });
+      return turn;
+    }
+
+    const answer = normalizeAssistantText(message.content);
+    session.messages.push({
+      role: "assistant",
+      content: answer
+    });
     this.emit({
-      type: "spawn",
+      type: "progress",
       sessionId: session.config.sessionId,
-      command: ["npx", ...args]
+      summary: answer
     });
-
-    const turn = await new Promise<ModelTurn>((resolve, reject) => {
-      const child = spawn("npx", args, {
-        cwd: session.config.cwd,
-        stdio: ["pipe", "pipe", "pipe"]
-      });
-      this.running.set(session.config.sessionId, child);
-
-      child.stdin.end(prompt);
-
-      let stderr = "";
-      let stdoutRemainder = "";
-      child.stdout.on("data", (chunk) => {
-        stdoutRemainder += chunk.toString();
-        const lines = stdoutRemainder.split("\n");
-        stdoutRemainder = lines.pop() ?? "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) {
-            continue;
-          }
-          try {
-            const event = JSON.parse(trimmed);
-            this.emit({
-              type: "progress",
-              sessionId: session.config.sessionId,
-              summary: this.summarizeEvent(event),
-              raw: event
-            });
-          } catch {
-            this.emit({
-              type: "progress",
-              sessionId: session.config.sessionId,
-              summary: trimmed
-            });
-          }
-        }
-      });
-
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-
-      child.on("error", (error) => {
-        reject(error);
-      });
-
-      child.on("close", async (code) => {
-        this.running.delete(session.config.sessionId);
-        if (code !== 0) {
-          reject(
-            new Error(
-              stderr ||
-                "Codex CLI exited with a non-zero status. Make sure Codex is installed and logged in."
-            )
-          );
-          return;
-        }
-
-        try {
-          const rawOutput = await readFile(outputPath, "utf8");
-          resolve(parseModelTurnPayload(JSON.parse(rawOutput)));
-        } catch (error) {
-          reject(error);
-        } finally {
-          await rm(tempDir, { recursive: true, force: true });
-        }
-      });
-    });
-
-    return turn;
+    return {
+      kind: "final",
+      summary: answer ? summarizeFinalMessage(answer) : "Completed",
+      answer
+    };
   }
 
   private emit(event: ModelAdapterEvent) {
     this.events.emit("event", event);
   }
-
-  private buildPrompt(session: SessionState) {
-    const toolDocs = listToolSchemas()
-      .map(
-        (tool) =>
-          `- ${tool.toolName}: ${JSON.stringify(tool.schema.properties ?? {}, null, 2)}`
-      )
-      .join("\n");
-
-    const history = session.history
-      .map((entry) => {
-        if (entry.role === "user") {
-          return `USER:\n${entry.content}`;
-        }
-        return `TOOL RESULT (${entry.callId}):\n${entry.content}`;
-      })
-      .join("\n\n");
-
-    return [
-      "You are BrowserControl's decision engine.",
-      "You do not have direct browser access. You must choose exactly one next tool call or provide the final answer.",
-      "Prefer DOM-native actions. Only ask for screenshots when the DOM state is insufficient.",
-      "Never request downloads, uploads, payments, CAPTCHAs, account recovery, or opening new tabs.",
-      "Do not repeat the same browser action unless the latest tool result or page snapshot clearly shows it is still necessary.",
-      "If a tool result reports a completed action, adapt to the new page state instead of retrying the same call.",
-      'Return strictly valid JSON matching the provided schema.',
-      'Always include all six fields: "kind", "summary", "callId", "toolName", "argsJson", "answer".',
-      'If kind is "tool_call", set "callId" to a non-empty ID, "toolName" to the requested tool, "argsJson" to a compact JSON string for the tool arguments object, and "answer" to an empty string.',
-      'If kind is "final", set "answer" to the final answer, and set "callId" to "", "toolName" to "", and "argsJson" to "{}".',
-      "",
-      `Goal: ${session.config.task.goal}`,
-      session.config.task.userNotes ? `User notes: ${session.config.task.userNotes}` : "",
-      `Max steps: ${session.config.task.maxSteps}`,
-      `Vision enabled: ${session.config.task.visionEnabled}`,
-      "",
-      "Available tools:",
-      toolDocs,
-      "",
-      "Conversation history:",
-      history || "No history yet."
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  private summarizeEvent(event: unknown) {
-    if (typeof event !== "object" || event === null) {
-      return "Codex emitted an event.";
-    }
-    const record = event as Record<string, unknown>;
-    if (typeof record.message === "string") {
-      return record.message;
-    }
-    if (typeof record.summary === "string") {
-      return record.summary;
-    }
-    if (typeof record.type === "string") {
-      return `Codex event: ${record.type}`;
-    }
-    return "Codex emitted an event.";
-  }
-
-  private resolveModel(model: ModelId) {
-    return ModelIdSchema.parse(model);
-  }
 }
 
-export function parseModelTurnPayload(input: unknown): ModelTurn {
-  const parsed = rawModelTurnSchema.parse(input);
+export function createDefaultModelAdapter() {
+  return new ChatMockModelAdapter();
+}
 
-  if (parsed.kind === "final") {
-    if (!parsed.answer.trim()) {
-      throw new Error("Model returned a final turn without an answer.");
-    }
-    return {
-      kind: "final",
-      summary: parsed.summary,
-      answer: parsed.answer
-    };
-  }
-
-  const toolName = BrowserToolNameSchema.parse(parsed.toolName);
-  if (!parsed.callId.trim()) {
-    throw new Error("Model returned a tool call without a callId.");
-  }
-  const args = parseArgsJson(parsed.argsJson);
-
+function parseToolCall(toolCall: {
+  id: string;
+  function: {
+    name: string;
+    arguments: string;
+  };
+}): Extract<ModelTurn, { kind: "tool_call" }> {
+  const toolName = BrowserToolNameSchema.parse(toolCall.function.name);
+  const args = parseToolArgs(toolName, toolCall.function.arguments);
   return {
     kind: "tool_call",
-    callId: parsed.callId,
-    summary: parsed.summary,
+    callId: createIncrementingId("call"),
+    summary: summarizeToolCall(toolName, args),
     toolName,
     args
   };
 }
 
-function parseArgsJson(raw: string) {
+function parseToolArgs(toolName: BrowserToolName, raw: string) {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new Error("Tool args JSON must decode to an object.");
-    }
-    return parsed as Record<string, unknown>;
+    parsed = raw.trim() ? JSON.parse(raw) : {};
   } catch (error) {
     throw new Error(
       error instanceof Error
-        ? `Model returned invalid argsJson: ${error.message}`
-        : "Model returned invalid argsJson."
+        ? `Model returned invalid JSON arguments for ${toolName}: ${error.message}`
+        : `Model returned invalid JSON arguments for ${toolName}.`
     );
   }
+  return getToolArgSchema(toolName).parse(parsed) as Record<string, unknown>;
+}
+
+function buildToolDefinitions() {
+  return TOOL_DEFINITIONS.map((tool) => ({
+    type: "function" as const,
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: z.toJSONSchema(getToolArgSchema(tool.name))
+    }
+  }));
+}
+
+const TOOL_DEFINITIONS: Array<{ name: BrowserToolName; description: string }> = [
+  {
+    name: "click_target",
+    description: "Click a visible target from the latest target map."
+  },
+  {
+    name: "click_coords",
+    description: "Click visible viewport coordinates only when no target ID is sufficient."
+  },
+  {
+    name: "type_target",
+    description: "Type text into an editable target from the latest target map."
+  },
+  {
+    name: "set_checkbox_target",
+    description: "Set a checkbox target to checked or unchecked."
+  },
+  {
+    name: "select_option_target",
+    description: "Choose an option inside a select target."
+  },
+  {
+    name: "scroll_viewport",
+    description: "Scroll the current page viewport."
+  },
+  {
+    name: "press_key",
+    description: "Press a keyboard key in the page."
+  },
+  {
+    name: "wait_for",
+    description: "Wait until the page meets a simple URL, selector, or text condition."
+  },
+  {
+    name: "inspect_target",
+    description: "Inspect one target and return more HTML/text details."
+  },
+  {
+    name: "extract_text",
+    description: "Extract compact page text, optionally filtered by a query."
+  },
+  {
+    name: "get_navigation_state",
+    description: "Return the current URL, title, and history state."
+  },
+  {
+    name: "go_back",
+    description: "Navigate back in the current tab."
+  }
+];
+
+function buildSystemPrompt() {
+  return [
+    "You are BrowserControl's decision engine.",
+    "You see a screenshot and a compact target map for the current page.",
+    "You can either call exactly one tool or provide the final answer.",
+    "Prefer semantic target tools over coordinate clicks.",
+    "Use click_coords only when the screenshot shows a location that is not represented well by a target.",
+    "After each tool result you will receive a fresh screenshot and a fresh target map.",
+    "Do not ask to open or reason across new tabs. Same-tab navigation is enforced.",
+    'If accessMode is "readonly", do not pretend interactions succeeded.',
+    "Be concise."
+  ].join("\n");
+}
+
+async function buildUserContent(message: string, imagePath?: string) {
+  if (!imagePath) {
+    return message;
+  }
+
+  return [
+    {
+      type: "text" as const,
+      text: message
+    },
+    {
+      type: "image_url" as const,
+      image_url: {
+        url: await readImageAsDataUrl(imagePath)
+      }
+    }
+  ];
+}
+
+async function readImageAsDataUrl(imagePath: string) {
+  const file = await readFile(imagePath);
+  return `data:image/png;base64,${file.toString("base64")}`;
+}
+
+function resolveRequestedModel(model: string, effort: Effort) {
+  return ModelIdSchema.parse(resolveEffectiveModelId(model, effort));
+}
+
+function normalizeAssistantText(content: string | null | undefined) {
+  return typeof content === "string" ? content.trim() : "";
+}
+
+function summarizeToolCall(toolName: BrowserToolName, args: Record<string, unknown>) {
+  const argsText = JSON.stringify(args);
+  return `${toolName}${argsText === "{}" ? "" : ` ${argsText}`}`;
+}
+
+function summarizeFinalMessage(message: string) {
+  const line = message
+    .split("\n")
+    .map((item) => item.trim())
+    .find(Boolean);
+  return line ? line.slice(0, 120) : "Completed";
 }

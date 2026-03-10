@@ -30,14 +30,20 @@ export type ModelDescriptor = z.infer<typeof ModelDescriptorSchema>;
 
 export const DEFAULT_MODEL_DESCRIPTORS = [
   {
-    id: "gpt-5.3-codex",
-    label: "GPT-5.3 Codex",
+    id: "auto",
+    label: "Auto",
     supportsEffort: true,
     defaultEffort: "medium"
   },
   {
-    id: "gpt-5.2-codex",
-    label: "GPT-5.2 Codex",
+    id: "gpt-5",
+    label: "GPT-5",
+    supportsEffort: true,
+    defaultEffort: "medium"
+  },
+  {
+    id: "gpt-5-codex",
+    label: "GPT-5 Codex",
     supportsEffort: true,
     defaultEffort: "medium"
   },
@@ -58,35 +64,23 @@ export const DEFAULT_MODEL_DESCRIPTORS = [
     label: "GPT-5.1 Codex mini",
     supportsEffort: true,
     defaultEffort: "low"
-  },
-  {
-    id: "custom",
-    label: "Custom model",
-    supportsEffort: false
   }
 ] satisfies ModelDescriptor[];
 
 export const BrowserToolNameSchema = z.enum([
   "get_page_snapshot",
-  "get_interactive_elements",
-  "get_element_details",
-  "extract_text",
-  "get_form_state",
-  "take_screenshot",
-  "get_navigation_state",
-  "click_element",
-  "type_into",
-  "set_checkbox",
-  "select_option",
-  "scroll_page",
-  "navigate_to",
-  "go_back",
-  "go_forward",
+  "click_target",
+  "click_coords",
+  "type_target",
+  "set_checkbox_target",
+  "select_option_target",
+  "scroll_viewport",
+  "press_key",
   "wait_for",
-  "focus_element",
-  "remember_fact",
-  "get_memory",
-  "summarize_progress"
+  "inspect_target",
+  "extract_text",
+  "get_navigation_state",
+  "go_back"
 ]);
 
 export type BrowserToolName = z.infer<typeof BrowserToolNameSchema>;
@@ -149,12 +143,83 @@ export const PageSnapshotSchema = z.object({
 export type PageSnapshot = z.infer<typeof PageSnapshotSchema>;
 export type InteractiveElement = z.infer<typeof InteractiveElementSchema>;
 
+export const InteractionTargetKindSchema = z.enum([
+  "link",
+  "button",
+  "input",
+  "textarea",
+  "select",
+  "checkbox",
+  "radio",
+  "tab",
+  "menuitem",
+  "other"
+]);
+
+export const InteractionTargetSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  role: z.string().nullable(),
+  kind: InteractionTargetKindSchema,
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+  enabled: z.boolean(),
+  selected: z.boolean().optional(),
+  valueHint: z.string().nullable().optional()
+});
+
+export type InteractionTarget = z.infer<typeof InteractionTargetSchema>;
+
+export const ActionPointSchema = z.object({
+  x: z.number(),
+  y: z.number()
+});
+
+export const ActionFeedbackSchema = z.object({
+  toolName: BrowserToolNameSchema,
+  targetId: z.string().nullable().optional(),
+  point: ActionPointSchema.nullable().optional(),
+  resolvedTag: z.string().nullable().optional(),
+  resolvedRole: z.string().nullable().optional(),
+  resolvedLabel: z.string().nullable().optional(),
+  usedFallback: z.boolean().optional(),
+  navigationOccurred: z.boolean().optional()
+});
+
+export type ActionFeedback = z.infer<typeof ActionFeedbackSchema>;
+
+export const VisualContextSchema = z.object({
+  url: z.string().url(),
+  title: z.string(),
+  viewport: z.object({
+    width: z.number(),
+    height: z.number()
+  }),
+  scrollPosition: z.object({
+    x: z.number(),
+    y: z.number()
+  }),
+  activeElementId: z.string().nullable(),
+  accessMode: AccessModeSchema,
+  targets: z.array(InteractionTargetSchema).default([]),
+  lastActionSummary: z.string().nullable().optional(),
+  lastError: z.string().nullable().optional(),
+  lastAction: ActionFeedbackSchema.nullable().optional(),
+  screenshotBase64: z.string().optional(),
+  artifactPath: z.string().optional()
+});
+
+export type VisualContext = z.infer<typeof VisualContextSchema>;
+
 export const TaskSpecSchema = z.object({
   goal: z.string().min(1),
   userNotes: z.string().optional(),
-  model: ModelIdSchema.default("gpt-5.3-codex"),
+  model: ModelIdSchema.default("auto"),
+  effort: EffortSchema.default("medium"),
   mode: z.literal("autonomous").default("autonomous"),
-  maxSteps: z.number().int().min(1).max(100).default(20),
+  maxSteps: z.number().int().min(1).max(100).default(12),
   visionEnabled: z.boolean().default(true)
 });
 
@@ -167,6 +232,8 @@ export const ToolResultSchema = z.object({
   code: z.string(),
   message: z.string(),
   data: z.unknown().optional(),
+  targets: z.array(InteractionTargetSchema).optional(),
+  actionFeedback: ActionFeedbackSchema.optional(),
   pageSnapshot: PageSnapshotSchema.optional(),
   screenshotBase64: z.string().optional(),
   artifactPath: z.string().optional()
@@ -285,7 +352,8 @@ export type ModelTurn = z.infer<typeof ModelTurnSchema>;
 export const ModelStartRequestSchema = z.object({
   sessionId: z.string(),
   task: z.string().min(1),
-  pageSnapshot: PageSnapshotSchema,
+  visualContext: VisualContextSchema.optional(),
+  pageSnapshot: PageSnapshotSchema.optional(),
   memory: z.record(z.string(), z.string()),
   feedSummary: z.string(),
   sessionOptions: SessionOptionsSchema
@@ -297,6 +365,7 @@ export const ModelContinueRequestSchema = z.object({
   sessionId: z.string(),
   callId: z.string(),
   toolResult: ToolResultSchema,
+  visualContext: VisualContextSchema.optional(),
   pageSnapshot: PageSnapshotSchema.optional(),
   memory: z.record(z.string(), z.string()),
   sessionOptions: SessionOptionsSchema
@@ -307,6 +376,7 @@ export type ModelContinueRequest = z.infer<typeof ModelContinueRequestSchema>;
 export const ModelMessageRequestSchema = z.object({
   sessionId: z.string(),
   prompt: z.string().min(1),
+  visualContext: VisualContextSchema.optional(),
   pageSnapshot: PageSnapshotSchema.optional(),
   memory: z.record(z.string(), z.string()),
   feedSummary: z.string(),
@@ -355,6 +425,10 @@ export const BackgroundToContentMessageSchema = z.discriminatedUnion("kind", [
     viewState: OverlayViewStateSchema,
     feed: z.array(OverlayFeedItemSchema),
     models: z.array(ModelDescriptorSchema)
+  }),
+  z.object({
+    kind: z.literal("set_overlay_suppressed"),
+    hidden: z.boolean()
   }),
   z.object({
     kind: z.literal("destroy_overlay")
@@ -430,21 +504,41 @@ export function createDefaultSessionOptions(
   });
 }
 
-export function createEnvelopeIds() {
+export function resolveEffectiveModelId(
+  model: string,
+  effort: Effort
+): string {
+  if (model === "auto") {
+    if (effort === "high") {
+      return "gpt-5.1-codex-max";
+    }
+    if (effort === "low") {
+      return "gpt-5.1-codex-mini";
+    }
+    return "gpt-5.1-codex";
+  }
+  return model;
+}
+
+const idCounters = new Map<string, number>();
+
+export function createIncrementingId(prefix = "id") {
+  const next = (idCounters.get(prefix) ?? 0) + 1;
+  idCounters.set(prefix, next);
+  return `${prefix}-${next}`;
+}
+
+export function createEnvelopeIds(prefix = "item") {
   return {
-    id: createUuid(),
+    id: createIncrementingId(prefix),
     timestamp: new Date().toISOString()
   };
 }
 
 export function createSessionId() {
-  return createUuid();
+  return createIncrementingId("run");
 }
 
-function createUuid() {
-  if (globalThis.crypto?.randomUUID) {
-    return globalThis.crypto.randomUUID();
-  }
-
-  return `fallback-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+export function resetIncrementingIds() {
+  idCounters.clear();
 }

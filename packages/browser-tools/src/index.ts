@@ -10,50 +10,37 @@ import {
 
 const toolArgSchemas = {
   get_page_snapshot: z.object({}).strict(),
-  get_interactive_elements: z
+  click_target: z
     .object({
-      filter: z.string().optional()
+      targetId: z.string()
     })
     .strict(),
-  get_element_details: z
+  click_coords: z
     .object({
-      elementId: z.string()
+      x: z.number(),
+      y: z.number()
     })
     .strict(),
-  extract_text: z
+  type_target: z
     .object({
-      query: z.string().optional()
-    })
-    .strict(),
-  get_form_state: z.object({}).strict(),
-  take_screenshot: z.object({}).strict(),
-  get_navigation_state: z.object({}).strict(),
-  click_element: z
-    .object({
-      elementId: z.string(),
-      clickMode: z.enum(["auto", "direct"]).default("auto")
-    })
-    .strict(),
-  type_into: z
-    .object({
-      elementId: z.string(),
+      targetId: z.string(),
       text: z.string(),
       append: z.boolean().default(false)
     })
     .strict(),
-  set_checkbox: z
+  set_checkbox_target: z
     .object({
-      elementId: z.string(),
+      targetId: z.string(),
       checked: z.boolean()
     })
     .strict(),
-  select_option: z
+  select_option_target: z
     .object({
-      elementId: z.string(),
+      targetId: z.string(),
       valueOrLabel: z.string()
     })
     .strict(),
-  scroll_page: z
+  scroll_viewport: z
     .object({
       directionOrPixels: z.union([
         z.enum(["up", "down", "top", "bottom"]),
@@ -61,13 +48,11 @@ const toolArgSchemas = {
       ])
     })
     .strict(),
-  navigate_to: z
+  press_key: z
     .object({
-      url: z.string().url()
+      key: z.string().min(1)
     })
     .strict(),
-  go_back: z.object({}).strict(),
-  go_forward: z.object({}).strict(),
   wait_for: z
     .object({
       condition: z.object({
@@ -77,23 +62,18 @@ const toolArgSchemas = {
       timeoutMs: z.number().int().min(100).max(30000).default(5000)
     })
     .strict(),
-  focus_element: z
+  inspect_target: z
     .object({
-      elementId: z.string()
+      targetId: z.string()
     })
     .strict(),
-  remember_fact: z
+  extract_text: z
     .object({
-      key: z.string(),
-      value: z.string()
+      query: z.string().optional()
     })
     .strict(),
-  get_memory: z
-    .object({
-      key: z.string().optional()
-    })
-    .strict(),
-  summarize_progress: z.object({}).strict()
+  get_navigation_state: z.object({}).strict(),
+  go_back: z.object({}).strict()
 } satisfies Record<BrowserToolName, z.ZodTypeAny>;
 
 export type ToolArgsMap = {
@@ -155,51 +135,22 @@ export function evaluatePolicy(
   args: unknown,
   snapshot?: PageSnapshot
 ): PolicyCheck {
-  if (toolName === "navigate_to") {
-    const parsed = validateToolArgs("navigate_to", args);
-    if (
-      parsed.url.startsWith("mailto:") ||
-      parsed.url.startsWith("tel:") ||
-      parsed.url.startsWith("ftp:")
-    ) {
-      return {
-        allowed: false,
-        reason: "External protocol launches are blocked in v1.",
-        action: toolName
-      };
-    }
-  }
-
-  if (toolName === "click_element" && snapshot) {
-    const parsed = validateToolArgs("click_element", args);
-    const target = snapshot.interactiveElements.find(
-      (item) => item.elementId === parsed.elementId
-    );
-    if (!target) {
-      return {
-        allowed: false,
-        reason: "Requested click target was not present in the latest snapshot.",
-        action: toolName
-      };
-    }
-
-    const hintText = target.selectorHints.join(" ").toLowerCase();
-    if (hintText.includes("file") || target.tag.toLowerCase() === "input:file") {
+  if (toolName === "click_coords" && snapshot) {
+    const parsed = validateToolArgs("click_coords", args);
+    const target = snapshot.interactiveElements.find((item) => {
+      const { x, y, width, height } = item.bbox;
+      return (
+        parsed.x >= x &&
+        parsed.x <= x + width &&
+        parsed.y >= y &&
+        parsed.y <= y + height
+      );
+    });
+    const hintText = target?.selectorHints.join(" ").toLowerCase() ?? "";
+    if (target && (hintText.includes("file") || target.tag.toLowerCase() === "input:file")) {
       return {
         allowed: false,
         reason: "File upload flows are blocked in v1.",
-        action: toolName
-      };
-    }
-  }
-
-  if (toolName === "type_into" && snapshot) {
-    const parsed = validateToolArgs("type_into", args);
-    const target = snapshot.forms.find((item) => item.elementId === parsed.elementId);
-    if (target?.type === "password") {
-      return {
-        allowed: false,
-        reason: "Sensitive account recovery and credential flows are blocked in v1.",
         action: toolName
       };
     }
@@ -222,10 +173,9 @@ export function verifyToolResult(
     : undefined;
 
   switch (toolName) {
-    case "click_element":
-    case "navigate_to":
+    case "click_target":
+    case "click_coords":
     case "go_back":
-    case "go_forward":
       if (!before || !afterSnapshot) {
         return { verified: true, reason: "No comparable snapshot available." };
       }
@@ -236,7 +186,9 @@ export function verifyToolResult(
           before.scrollPosition.y !== afterSnapshot.scrollPosition.y,
         reason: "Navigation or visible state changed."
       };
-    case "type_into": {
+    case "type_target":
+    case "set_checkbox_target":
+    case "select_option_target": {
       if (!afterSnapshot) {
         return { verified: false, reason: "Missing post-action snapshot." };
       }
@@ -245,14 +197,6 @@ export function verifyToolResult(
         reason: "Input action completed and snapshot was refreshed."
       };
     }
-    case "set_checkbox":
-    case "select_option":
-      return {
-        verified: Boolean(afterSnapshot),
-        reason: afterSnapshot
-          ? "Selection state refreshed after action."
-          : "Missing post-action snapshot."
-      };
     default:
       return { verified: true, reason: "No additional verification required." };
   }

@@ -4,6 +4,7 @@ import {
   MAX_OVERLAY_SIZE,
   MIN_OVERLAY_SIZE,
   BackgroundToContentMessageSchema,
+  resolveEffectiveModelId,
   type BackgroundToContentMessage,
   type ModelDescriptor,
   type OverlayFeedItem,
@@ -11,10 +12,20 @@ import {
   type ToolCallRequest
 } from "../../../packages/shared/src/index.js";
 
-type RuntimeBridge = {
+export type RuntimeBridge = {
   addMessageListener(listener: (message: unknown) => unknown): void;
   sendMessage(message: unknown): Promise<unknown>;
   getURL(path: string): string;
+};
+
+export type ContentExtensionApi = {
+  runtime: {
+    onMessage: {
+      addListener(listener: (message: unknown) => unknown): void;
+    };
+    sendMessage(message: unknown): Promise<unknown>;
+    getURL(path: string): string;
+  };
 };
 
 type ContentMessage =
@@ -25,6 +36,20 @@ type ContentMessage =
     }
   | {
       kind: "overlay_ping";
+    }
+  | {
+      kind: "set_overlay_suppressed";
+      hidden: boolean;
+    }
+  | {
+      kind: "sanitize_capture";
+      dataUrl: string;
+      overlayBounds: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+      } | null;
     };
 
 type OverlayPayload = Extract<BackgroundToContentMessage, { kind: "overlay_state" }>;
@@ -76,6 +101,7 @@ export class OverlayHarness {
   private draftPosition: OverlayViewState["position"] | null = null;
   private draftSize: OverlayViewState["size"] | null = null;
   private bootstrapped = false;
+  private overlaySuppressed = false;
 
   constructor(
     private readonly runtime: RuntimeBridge,
@@ -135,9 +161,39 @@ export class OverlayHarness {
       return { ok: true };
     }
 
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      (message as Record<string, unknown>).kind === "set_overlay_suppressed"
+    ) {
+      this.overlaySuppressed = Boolean((message as { hidden?: boolean }).hidden);
+      this.applyOverlaySuppression();
+      return { ok: true };
+    }
+
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      (message as Record<string, unknown>).kind === "sanitize_capture"
+    ) {
+      const payload = message as {
+        dataUrl: string;
+        overlayBounds: {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+        } | null;
+      };
+      return await sanitizeCapturedImage(payload.dataUrl, payload.overlayBounds);
+    }
+
     const payload = BackgroundToContentMessageSchema.parse(message);
     if (payload.kind === "destroy_overlay") {
       this.destroyHost();
+      return { ok: true };
+    }
+    if (payload.kind !== "overlay_state") {
       return { ok: true };
     }
 
@@ -279,6 +335,7 @@ export class OverlayHarness {
     };
 
     this.bindUi();
+    this.applyOverlaySuppression();
   }
 
   private bindUi() {
@@ -458,6 +515,15 @@ export class OverlayHarness {
     });
   }
 
+  private applyOverlaySuppression() {
+    if (this.host) {
+      this.host.style.display = this.overlaySuppressed ? "none" : "block";
+    }
+    if (this.refs) {
+      this.refs.shell.dataset.suppressed = this.overlaySuppressed ? "true" : "false";
+    }
+  }
+
   private render() {
     if (!this.payload || !this.refs) {
       return;
@@ -496,7 +562,8 @@ export class OverlayHarness {
       this.refs.modelSelect,
       this.refs.modelInput,
       models,
-      viewState.sessionOptions.model
+      viewState.sessionOptions.model,
+      viewState.sessionOptions.effort
     );
     this.refs.effortSelect.value = viewState.sessionOptions.effort;
     this.refs.accessButton.dataset.accessMode = viewState.sessionOptions.accessMode;
@@ -590,6 +657,44 @@ export class OverlayHarness {
   }
 }
 
+async function sanitizeCapturedImage(
+  dataUrl: string,
+  overlayBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null
+) {
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load captured image."));
+    img.src = dataUrl;
+  });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Unable to sanitize captured image.");
+  }
+
+  context.drawImage(image, 0, 0);
+  if (overlayBounds && overlayBounds.width > 0 && overlayBounds.height > 0) {
+    context.fillStyle = "#10151d";
+    context.fillRect(
+      Math.round(overlayBounds.x),
+      Math.round(overlayBounds.y),
+      Math.round(overlayBounds.width),
+      Math.round(overlayBounds.height)
+    );
+  }
+
+  return canvas.toDataURL("image/png");
+}
+
 function renderFeedItem(doc: Document, item: OverlayFeedItem) {
   const node = doc.createElement("article");
   node.className = `bc-feed-item bc-feed-item-${item.kind}`;
@@ -629,7 +734,8 @@ function renderModelControls(
   modelSelect: HTMLSelectElement,
   modelInput: HTMLInputElement,
   models: ModelDescriptor[],
-  selectedModel: string
+  selectedModel: string,
+  effort: OverlayViewState["sessionOptions"]["effort"]
 ) {
   if (models.length === 0) {
     modelSelect.hidden = true;
@@ -644,11 +750,21 @@ function renderModelControls(
     ...models.map((model) => {
       const option = modelSelect.ownerDocument.createElement("option");
       option.value = model.id;
-      option.textContent = model.label;
+      if (model.id === "auto") {
+        const resolvedId = resolveEffectiveModelId(model.id, effort);
+        const resolvedLabel = models.find((candidate) => candidate.id === resolvedId)?.label ?? resolvedId;
+        option.textContent = `${model.label} (${resolvedLabel})`;
+      } else {
+        option.textContent = model.label;
+      }
       return option;
     })
   );
   modelSelect.value = selectedModel;
+  const resolvedId = resolveEffectiveModelId(selectedModel, effort);
+  const resolvedLabel = models.find((candidate) => candidate.id === resolvedId)?.label ?? resolvedId;
+  modelSelect.title =
+    selectedModel === "auto" ? `Auto currently uses ${resolvedLabel}` : resolvedLabel;
 }
 
 function feedItemLabel(item: OverlayFeedItem) {
@@ -658,6 +774,9 @@ function feedItemLabel(item: OverlayFeedItem) {
     case "answer":
       return "Answer";
     case "tool":
+      if (typeof item.metadata?.label === "string" && item.metadata.label.trim()) {
+        return `Tool • ${item.metadata.label}`;
+      }
       return item.toolName ? `Tool • ${item.toolName}` : "Tool";
     case "warning":
       return "Warning";
@@ -816,15 +935,7 @@ function canCloseLocally(taskState: OverlayViewState["taskState"]) {
   return taskState !== "running" && taskState !== "starting";
 }
 
-function createRuntimeBridge(ext: {
-  runtime: {
-    onMessage: {
-      addListener(listener: (message: unknown) => unknown): void;
-    };
-    sendMessage(message: unknown): Promise<unknown>;
-    getURL(path: string): string;
-  };
-}): RuntimeBridge {
+export function createRuntimeBridge(ext: ContentExtensionApi): RuntimeBridge {
   return {
     addMessageListener(listener) {
       ext.runtime.onMessage.addListener(listener);
@@ -838,18 +949,10 @@ function createRuntimeBridge(ext: {
   };
 }
 
-function getExtensionApi() {
+export function getExtensionApi() {
   const globalRecord = globalThis as Record<string, unknown>;
   return (globalRecord.browser ?? globalRecord.chrome) as
-    | {
-        runtime: {
-          onMessage: {
-            addListener(listener: (message: unknown) => unknown): void;
-          };
-          sendMessage(message: unknown): Promise<unknown>;
-          getURL(path: string): string;
-        };
-      }
+    | ContentExtensionApi
     | undefined;
 }
 
@@ -859,14 +962,35 @@ declare global {
   }
 }
 
-const ext = getExtensionApi();
-if (ext && window.top === window) {
+export function bootContentHarness(
+  options: {
+    ext?: ContentExtensionApi;
+    cssTextPromise?: Promise<string>;
+    forceReplace?: boolean;
+  } = {}
+) {
+  const ext = options.ext ?? getExtensionApi();
+  if (!ext || window.top !== window) {
+    return null;
+  }
+
   const existing = window.__browsercontrolOverlayHarness;
   if (existing) {
-    void existing.bootstrap();
-  } else {
-    const harness = new OverlayHarness(createRuntimeBridge(ext));
-    window.__browsercontrolOverlayHarness = harness;
-    void harness.bootstrap();
+    if (options.forceReplace) {
+      existing.destroyHost();
+    } else {
+      void existing.bootstrap();
+      return existing;
+    }
   }
+
+  const harness = new OverlayHarness(
+    createRuntimeBridge(ext),
+    document,
+    window,
+    options.cssTextPromise
+  );
+  window.__browsercontrolOverlayHarness = harness;
+  void harness.bootstrap();
+  return harness;
 }

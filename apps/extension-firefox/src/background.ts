@@ -1,4 +1,3 @@
-import { validateToolArgs } from "../../../packages/browser-tools/src/index.js";
 import {
   BackgroundToContentMessageSchema,
   DEFAULT_MODEL_DESCRIPTORS,
@@ -15,11 +14,17 @@ import {
   ToolCallRequestSchema,
   createDefaultSessionOptions,
   createEnvelopeIds,
+  createIncrementingId,
   createSessionId,
   type AccessMode,
+  type ActionFeedback,
   type BackgroundToContentMessage,
   type BrowserToolName,
+  type InteractionTarget,
   type ModelDescriptor,
+  type ModelContinueRequest,
+  type ModelMessageRequest,
+  type ModelStartRequest,
   type ModelTurn,
   type OverlayFeedItem,
   type OverlayViewState,
@@ -27,24 +32,22 @@ import {
   type SessionOptions,
   type TaskState,
   type ToolCallRequest,
-  type ToolResult
+  type ToolResult,
+  type VisualContext
 } from "../../../packages/shared/src/index.js";
 
 const AGENT_HTTP = "http://127.0.0.1:4317";
 const OVERLAY_BOUNDS_STORAGE_KEY = "overlay-bounds-v1";
+const EXTENSION_RUNTIME_STORAGE_KEY = "extension-runtime-v1";
 const CONNECTION_REFRESH_WINDOW_MS = 4000;
+const RUNTIME_REFRESH_WINDOW_MS = 1500;
 
 const READONLY_ALLOWED_TOOLS = new Set<BrowserToolName>([
   "get_page_snapshot",
-  "get_interactive_elements",
-  "get_element_details",
+  "inspect_target",
   "extract_text",
-  "get_form_state",
-  "take_screenshot",
   "get_navigation_state",
-  "remember_fact",
-  "get_memory",
-  "summarize_progress"
+  "go_back"
 ]);
 
 type ExtensionApi = {
@@ -57,7 +60,7 @@ type ExtensionApi = {
   };
   tabs: {
     sendMessage(tabId: number, message: unknown): Promise<unknown>;
-    executeScript(tabId: number, details: { file: string }): Promise<unknown>;
+    executeScript(tabId: number, details: { file?: string; code?: string }): Promise<unknown>;
     update(tabId: number, updateProperties: { url: string }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
     goForward(tabId: number): Promise<void>;
@@ -95,9 +98,9 @@ type FetchLike = typeof fetch;
 type TabSessionState = {
   tabId: number;
   feed: OverlayFeedItem[];
-  memory: Record<string, string>;
   models: ModelDescriptor[];
   lastSnapshot: PageSnapshot | null;
+  lastTargets: InteractionTarget[];
   viewState: OverlayViewState;
   pauseRequested: boolean;
   busy: boolean;
@@ -106,6 +109,8 @@ type TabSessionState = {
     | {
         callId: string;
         toolResult: ToolResult;
+        lastActionSummary?: string;
+        lastError?: string;
       }
     | null;
   lastConnectionCheckAt: number;
@@ -120,6 +125,150 @@ type ContentToolMessage = {
 type ContentPingMessage = {
   kind: "overlay_ping";
 };
+
+type ContentOverlaySuppressionMessage = {
+  kind: "set_overlay_suppressed";
+  hidden: boolean;
+};
+
+type ContentSanitizeCaptureMessage = {
+  kind: "sanitize_capture";
+  dataUrl: string;
+  overlayBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
+};
+
+type ExtensionRuntimePayload = {
+  ok: true;
+  version: string;
+  generatedAt: string;
+  contentScript: string;
+  overlayCss: string;
+};
+
+type StoredExtensionRuntime = {
+  version: string;
+  generatedAt: string;
+  contentScript: string;
+  overlayCss: string;
+};
+
+class ExtensionRuntimeManager {
+  private cachedRuntime: StoredExtensionRuntime | null = null;
+  private storageLoadPromise: Promise<void> | null = null;
+  private refreshPromise: Promise<void> | null = null;
+  private lastRefreshAt = 0;
+
+  constructor(
+    private readonly ext: ExtensionApi,
+    private readonly fetchImpl: FetchLike
+  ) {}
+
+  async resolveContentInjection(force = false) {
+    await this.refreshIfNeeded(force);
+
+    const runtime = this.cachedRuntime;
+    if (runtime) {
+      return {
+        version: `remote:${runtime.version}`,
+        details: {
+          code: this.buildInjectedContentScript(runtime)
+        }
+      };
+    }
+
+    return {
+      version: "packaged",
+      details: {
+        file: "content.js"
+      }
+    };
+  }
+
+  async refreshIfNeeded(force = false) {
+    await this.ensureLoadedFromStorage();
+    const now = Date.now();
+    if (!force && now - this.lastRefreshAt < RUNTIME_REFRESH_WINDOW_MS) {
+      return;
+    }
+    if (this.refreshPromise) {
+      await this.refreshPromise;
+      return;
+    }
+
+    this.refreshPromise = (async () => {
+      try {
+        const response = await this.fetchImpl(`${AGENT_HTTP}/api/extension/runtime`);
+        if (!response.ok) {
+          throw new Error(`Extension runtime responded with ${response.status}.`);
+        }
+
+        const payload = parseExtensionRuntimePayload(await response.json());
+        this.cachedRuntime = {
+          version: payload.version,
+          generatedAt: payload.generatedAt,
+          contentScript: payload.contentScript,
+          overlayCss: payload.overlayCss
+        };
+        this.lastRefreshAt = Date.now();
+        await this.persistRuntime();
+      } catch (error) {
+        void error;
+        this.lastRefreshAt = Date.now();
+      } finally {
+        this.refreshPromise = null;
+      }
+    })();
+
+    await this.refreshPromise;
+  }
+
+  private async ensureLoadedFromStorage() {
+    if (this.storageLoadPromise) {
+      await this.storageLoadPromise;
+      return;
+    }
+
+    this.storageLoadPromise = (async () => {
+      if (!this.ext.storage?.local) {
+        return;
+      }
+
+      try {
+        const stored = await this.ext.storage.local.get(EXTENSION_RUNTIME_STORAGE_KEY);
+        const payload = parseStoredExtensionRuntime(
+          stored[EXTENSION_RUNTIME_STORAGE_KEY] as Record<string, unknown> | undefined
+        );
+        this.cachedRuntime = payload;
+      } catch {
+        this.cachedRuntime = null;
+      }
+    })();
+
+    await this.storageLoadPromise;
+  }
+
+  private async persistRuntime() {
+    if (!this.ext.storage?.local || !this.cachedRuntime) {
+      return;
+    }
+
+    await this.ext.storage.local.set({
+      [EXTENSION_RUNTIME_STORAGE_KEY]: this.cachedRuntime
+    });
+  }
+
+  private buildInjectedContentScript(runtime: StoredExtensionRuntime) {
+    return [
+      `globalThis.__browsercontrolRemoteOverlayCss = ${JSON.stringify(runtime.overlayCss)};`,
+      runtime.contentScript
+    ].join("\n");
+  }
+}
 
 export function isToolAllowedInAccessMode(
   toolName: BrowserToolName,
@@ -151,13 +300,14 @@ export function reduceSessionOptions(
 }
 
 class OverlayController {
-  private injectedTabs = new Set<number>();
+  private injectedTabs = new Map<number, string>();
   private storedBoundsPromise: Promise<Pick<OverlayViewState, "position" | "size">>;
 
   constructor(
     private readonly ext: ExtensionApi,
     private readonly getState: (tabId: number) => Promise<TabSessionState>,
-    private readonly sendState: (tabId: number) => Promise<void>
+    private readonly sendState: (tabId: number) => Promise<void>,
+    private readonly runtimeManager: ExtensionRuntimeManager
   ) {
     this.storedBoundsPromise = this.loadStoredBounds();
   }
@@ -180,7 +330,6 @@ class OverlayController {
 
   async handleOverlayReady(tabId: number) {
     const state = await this.getState(tabId);
-    this.injectedTabs.add(tabId);
     state.viewState.destroyed = false;
     state.viewState.visible = true;
     state.viewState.pendingActivity = false;
@@ -254,9 +403,14 @@ class OverlayController {
   }
 
   async ensureContentInjected(tabId: number) {
-    if (!this.injectedTabs.has(tabId)) {
-      await this.ext.tabs.executeScript(tabId, { file: "content.js" });
-      this.injectedTabs.add(tabId);
+    const injection = await this.runtimeManager.resolveContentInjection();
+    const previousVersion = this.injectedTabs.get(tabId);
+    if (previousVersion !== injection.version) {
+      await this.ext.tabs.executeScript(tabId, injection.details);
+      this.injectedTabs.set(tabId, injection.version);
+      if (previousVersion) {
+        await this.noteRuntimeUpdated(tabId, previousVersion, injection.version);
+      }
       return;
     }
 
@@ -264,9 +418,22 @@ class OverlayController {
       await this.ext.tabs.sendMessage(tabId, { kind: "overlay_ping" } satisfies ContentPingMessage);
     } catch {
       this.injectedTabs.delete(tabId);
-      await this.ext.tabs.executeScript(tabId, { file: "content.js" });
-      this.injectedTabs.add(tabId);
+      const retry = await this.runtimeManager.resolveContentInjection(true);
+      await this.ext.tabs.executeScript(tabId, retry.details);
+      this.injectedTabs.set(tabId, retry.version);
     }
+  }
+
+  private async noteRuntimeUpdated(
+    tabId: number,
+    previousVersion: string,
+    nextVersion: string
+  ) {
+    const state = await this.getState(tabId);
+    appendFeedItem(state, "status", {
+      title: "Extension updated",
+      body: `${formatRuntimeVersion(previousVersion)} -> ${formatRuntimeVersion(nextVersion)}`
+    });
   }
 
   handleTabRemoved(tabId: number) {
@@ -286,6 +453,75 @@ class OverlayController {
     await this.sendContentMessage(tabId, this.createPayload(state));
   }
 
+  async getVisibleBounds(tabId: number) {
+    const state = await this.getState(tabId);
+    if (state.viewState.destroyed || !state.viewState.visible) {
+      return null;
+    }
+    return {
+      x: state.viewState.position.x,
+      y: state.viewState.position.y,
+      width: state.viewState.size.width,
+      height: state.viewState.size.height
+    };
+  }
+
+  async withSuppressed<T>(tabId: number, task: () => Promise<T>) {
+    await this.setSuppressed(tabId, true);
+    await this.forceOverlayVisibility(tabId, true);
+    await delay(34);
+    try {
+      return await task();
+    } finally {
+      await this.forceOverlayVisibility(tabId, false);
+      await this.setSuppressed(tabId, false);
+      await delay(16);
+    }
+  }
+
+  async setSuppressed(tabId: number, hidden: boolean) {
+    const state = await this.getState(tabId);
+    if (state.viewState.destroyed || !state.viewState.visible) {
+      return;
+    }
+    await this.ensureContentInjected(tabId);
+    await this.sendContentMessage(tabId, {
+      kind: "set_overlay_suppressed",
+      hidden
+    } satisfies ContentOverlaySuppressionMessage);
+  }
+
+  private async forceOverlayVisibility(tabId: number, hidden: boolean) {
+    try {
+      await this.ext.tabs.executeScript(tabId, {
+        code: `
+          (() => {
+            const host = document.getElementById("browsercontrol-host");
+            if (!(host instanceof HTMLElement)) return;
+            if (${hidden ? "true" : "false"}) {
+              host.dataset.bcPrevDisplay = host.style.display || "";
+              host.style.setProperty("display", "none", "important");
+              host.style.setProperty("visibility", "hidden", "important");
+              host.style.setProperty("pointer-events", "none", "important");
+              return;
+            }
+            const previous = host.dataset.bcPrevDisplay ?? "";
+            if (previous) {
+              host.style.display = previous;
+            } else {
+              host.style.removeProperty("display");
+            }
+            host.style.removeProperty("visibility");
+            host.style.removeProperty("pointer-events");
+            delete host.dataset.bcPrevDisplay;
+          })();
+        `
+      });
+    } catch {
+      return;
+    }
+  }
+
   private createPayload(state: TabSessionState): BackgroundToContentMessage {
     return BackgroundToContentMessageSchema.parse({
       kind: "overlay_state",
@@ -295,7 +531,7 @@ class OverlayController {
     });
   }
 
-  private async sendContentMessage(tabId: number, message: BackgroundToContentMessage) {
+  private async sendContentMessage(tabId: number, message: unknown) {
     try {
       await this.ext.tabs.sendMessage(tabId, message);
     } catch {
@@ -358,42 +594,10 @@ class ToolExecutionController {
     private readonly overlay: OverlayController
   ) {}
 
-  async execute(state: TabSessionState, turn: Extract<ModelTurn, { kind: "tool_call" }>) {
-    if (turn.toolName === "remember_fact") {
-      const parsed = validateToolArgs("remember_fact", turn.args);
-      state.memory[parsed.key] = parsed.value;
-      return {
-        ok: true,
-        code: "ok",
-        message: "Stored fact in memory.",
-        data: {
-          key: parsed.key,
-          value: parsed.value
-        }
-      } satisfies ToolResult;
-    }
-
-    if (turn.toolName === "get_memory") {
-      const parsed = validateToolArgs("get_memory", turn.args);
-      return {
-        ok: true,
-        code: "ok",
-        message: "Loaded memory.",
-        data: parsed.key ? { [parsed.key]: state.memory[parsed.key] ?? null } : state.memory
-      } satisfies ToolResult;
-    }
-
-    if (turn.toolName === "summarize_progress") {
-      return {
-        ok: true,
-        code: "ok",
-        message: "Summarized progress.",
-        data: {
-          summary: summarizeFeed(state.feed)
-        }
-      } satisfies ToolResult;
-    }
-
+  async executeToolCall(
+    state: TabSessionState,
+    turn: Extract<ModelTurn, { kind: "tool_call" }>
+  ) {
     if (!isToolAllowedInAccessMode(turn.toolName, state.viewState.sessionOptions.accessMode)) {
       return {
         ok: false,
@@ -407,7 +611,7 @@ class ToolExecutionController {
 
     const request = ToolCallRequestSchema.parse({
       type: "tool_call_request",
-      requestId: createEnvelopeIds().id,
+      requestId: createEnvelopeIds("req").id,
       sessionId: state.viewState.sessionId,
       tabId: state.tabId,
       timestamp: new Date().toISOString(),
@@ -429,72 +633,27 @@ class ToolExecutionController {
       };
     }
 
-    if (request.toolName === "navigate_to") {
-      const parsed = validateToolArgs("navigate_to", request.args);
-      await this.ext.tabs.update(tabId, { url: parsed.url });
-      await waitForTabUpdate(this.ext, tabId);
-      return this.requestPageSnapshot(tabId, request.sessionId);
-    }
-
     if (request.toolName === "go_back") {
       await this.ext.tabs.goBack(tabId);
       await waitForTabUpdate(this.ext, tabId);
       return this.requestPageSnapshot(tabId, request.sessionId);
     }
 
-    if (request.toolName === "go_forward") {
-      await this.ext.tabs.goForward(tabId);
-      await waitForTabUpdate(this.ext, tabId);
-      return this.requestPageSnapshot(tabId, request.sessionId);
-    }
-
-    if (request.toolName === "take_screenshot") {
-      const dataUrl = await this.ext.tabs.captureVisibleTab(undefined, { format: "png" });
-      return {
-        ok: true,
-        code: "ok",
-        message: "Captured visible tab screenshot.",
-        screenshotBase64: dataUrl.split(",")[1]
-      };
-    }
-
     await this.overlay.ensureContentInjected(tabId);
-
-    if (request.toolName === "click_element") {
-      try {
-        const result = (await this.ext.tabs.sendMessage(tabId, {
-          kind: "run_tool",
-          request
-        } satisfies ContentToolMessage)) as ToolResult;
-        return await this.reconcileClickNavigation(request, result);
-      } catch (error) {
-        const navigated = await waitForPotentialNavigation(this.ext, tabId, 5000);
-        if (!navigated) {
-          throw error;
-        }
-        const snapshot = await this.requestPageSnapshot(tabId, request.sessionId);
-        if (!snapshot.ok || !snapshot.pageSnapshot) {
-          return snapshot;
-        }
-        return {
-          ok: true,
-          code: "ok",
-          message: "Clicked element and followed page navigation.",
-          pageSnapshot: snapshot.pageSnapshot
-        } satisfies ToolResult;
-      }
-    }
-
-    return (await this.ext.tabs.sendMessage(tabId, {
+    const result = (await this.ext.tabs.sendMessage(tabId, {
       kind: "run_tool",
       request
     } satisfies ContentToolMessage)) as ToolResult;
+    if (request.toolName === "click_target" || request.toolName === "click_coords") {
+      return await this.reconcileNavigation(request, result);
+    }
+    return result;
   }
 
   private requestPageSnapshot(tabId: number, sessionId: string) {
     return this.executeToolRequest({
       type: "tool_call_request",
-      requestId: createEnvelopeIds().id,
+      requestId: createEnvelopeIds("req").id,
       sessionId,
       tabId,
       timestamp: new Date().toISOString(),
@@ -503,7 +662,7 @@ class ToolExecutionController {
     });
   }
 
-  private async reconcileClickNavigation(request: ToolCallRequest, result: ToolResult) {
+  private async reconcileNavigation(request: ToolCallRequest, result: ToolResult) {
     const tabId = request.tabId;
     if (tabId === null || !result.ok) {
       return result;
@@ -524,14 +683,19 @@ class ToolExecutionController {
 
     return {
       ...result,
-      message: "Clicked element and synced the new page state.",
-      pageSnapshot: snapshot.pageSnapshot
+      message: `${result.message} Navigation completed and the new page state was synced.`,
+      pageSnapshot: snapshot.pageSnapshot,
+      targets: snapshot.targets ?? result.targets,
+      actionFeedback: mergeActionFeedback(result.actionFeedback, {
+        navigationOccurred: true
+      })
     };
   }
 }
 
 class SessionController {
   constructor(
+    private readonly ext: ExtensionApi,
     private readonly getState: (tabId: number) => Promise<TabSessionState>,
     private readonly overlay: OverlayController,
     private readonly tools: ToolExecutionController,
@@ -674,6 +838,16 @@ class SessionController {
       body: trimmed
     });
     appendFeedItem(state, "status", {
+      title:
+        state.viewState.sessionOptions.accessMode === "take_control"
+          ? "Access: Take Control"
+          : "Access: Readonly",
+      body:
+        state.viewState.sessionOptions.accessMode === "take_control"
+          ? "Browser actions are enabled for this run."
+          : "Browser actions are blocked. Switch Access to Take Control to allow clicks and typing."
+    });
+    appendFeedItem(state, "status", {
       title: "Thinking...",
       body: isFollowUp ? "Preparing the next model turn." : "Preparing the first model turn."
     });
@@ -750,7 +924,14 @@ class SessionController {
     if (state.pendingContinuation) {
       const pending = state.pendingContinuation;
       state.pendingContinuation = null;
-      void this.continueAfterTool(tabId, state, pending.callId, pending.toolResult);
+      void this.continueAfterTool(
+        tabId,
+        state,
+        pending.callId,
+        pending.toolResult,
+        pending.lastActionSummary,
+        pending.lastError
+      );
       return { ok: true };
     }
 
@@ -793,8 +974,8 @@ class SessionController {
 
       state.viewState.headerMessage = turn.summary;
       appendFeedItem(state, "tool", {
-        title: `Running ${turn.toolName}`,
-        body: turn.summary,
+        title: `Tool ${turn.toolName}`,
+        body: formatToolCallBody(turn.summary, turn.args),
         toolName: turn.toolName,
         stage: "start"
       });
@@ -802,11 +983,14 @@ class SessionController {
 
       try {
         state.busy = true;
-        const toolResult = await this.tools.execute(state, turn);
+        const toolResult = await this.tools.executeToolCall(state, turn);
         state.busy = false;
 
         if (toolResult.pageSnapshot) {
           state.lastSnapshot = toolResult.pageSnapshot;
+        }
+        if (toolResult.targets) {
+          state.lastTargets = toolResult.targets;
         }
 
         if (toolResult.code === "readonly_blocked") {
@@ -816,26 +1000,46 @@ class SessionController {
           });
         }
 
-        appendFeedItem(state, toolResult.ok ? "tool" : "error", {
-          title: toolResult.ok ? `Finished ${turn.toolName}` : `Failed ${turn.toolName}`,
-          body: toolResult.message,
-          toolName: turn.toolName,
-          stage: toolResult.ok ? "finish" : toolResult.code === "readonly_blocked" ? "blocked" : "fail"
-        });
+        appendFeedItem(
+          state,
+          toolResult.ok ? "tool" : "error",
+          {
+            title: toolResult.ok
+              ? `Finished ${turn.toolName}`
+              : `Failed ${turn.toolName}`,
+            body: formatToolResultBody(toolResult),
+            toolName: turn.toolName,
+            stage: toolResult.ok
+              ? "finish"
+              : toolResult.code === "readonly_blocked"
+                ? "blocked"
+                : "fail"
+          }
+        );
         state.viewState.headerMessage = "Thinking...";
         await this.overlay.sync(state.tabId);
 
+        const lastActionSummary = turn.summary;
+        const lastError = toolResult.ok ? undefined : toolResult.message;
         if (state.pauseRequested) {
           state.pendingContinuation = {
             callId: turn.callId,
-            toolResult
+            toolResult,
+            lastActionSummary,
+            lastError
           };
           this.enterPausedState(state);
           await this.overlay.sync(state.tabId);
           return;
         }
 
-        turn = await this.requestContinue(state, turn.callId, toolResult);
+        turn = await this.requestContinue(
+          state,
+          turn.callId,
+          toolResult,
+          lastActionSummary,
+          lastError
+        );
       } catch (error) {
         console.error("[BrowserControl] model loop failed", error);
         state.busy = false;
@@ -850,10 +1054,18 @@ class SessionController {
     tabId: number,
     state: TabSessionState,
     callId: string,
-    toolResult: ToolResult
+    toolResult: ToolResult,
+    lastActionSummary?: string,
+    lastError?: string
   ) {
     try {
-      const turn = await this.requestContinue(state, callId, toolResult);
+      const turn = await this.requestContinue(
+        state,
+        callId,
+        toolResult,
+        lastActionSummary,
+        lastError
+      );
       void this.runLoop(state, turn);
     } catch (error) {
       console.error("[BrowserControl] failed to continue model session", error);
@@ -865,21 +1077,30 @@ class SessionController {
   private async requestContinue(
     state: TabSessionState,
     callId: string,
-    toolResult: ToolResult
+    toolResult: ToolResult,
+    lastActionSummary?: string,
+    lastError?: string
   ) {
     const sessionId = state.viewState.sessionId;
     if (!sessionId) {
       throw new Error("Missing model session id.");
     }
     state.busy = true;
+    const visualContext = await this.captureVisualContext(state, {
+      lastActionSummary: lastActionSummary ?? toolResult.message,
+      lastError,
+      lastAction: toolResult.actionFeedback ?? null
+    });
     const requestBody = ModelContinueRequestSchema.parse({
       sessionId,
       callId,
       toolResult,
-      pageSnapshot: state.lastSnapshot ?? undefined,
-      memory: state.memory,
+      visualContext,
+      pageSnapshot: undefined,
+      memory: {},
       sessionOptions: state.viewState.sessionOptions
     });
+    await this.overlay.sync(state.tabId);
     const response = await this.fetchImpl(`${AGENT_HTTP}/api/model/continue`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -894,7 +1115,7 @@ class SessionController {
   }
 
   private async capturePageSnapshot(state: TabSessionState) {
-    const snapshotResult = await this.tools.execute(state, {
+    const snapshotResult = await this.tools.executeToolCall(state, {
       kind: "tool_call",
       callId: createEnvelopeIds().id,
       summary: "Collecting page snapshot.",
@@ -904,7 +1125,43 @@ class SessionController {
     if (!snapshotResult.ok || !snapshotResult.pageSnapshot) {
       throw new Error(snapshotResult.message || "Unable to collect the current page snapshot.");
     }
+    state.lastTargets = snapshotResult.targets ?? [];
     return snapshotResult.pageSnapshot;
+  }
+
+  private async captureVisualContext(
+    state: TabSessionState,
+    options: {
+      lastActionSummary?: string;
+      lastError?: string;
+      lastAction?: ActionFeedback | null;
+    } = {}
+  ): Promise<VisualContext> {
+    const snapshot = state.lastSnapshot ?? (await this.capturePageSnapshot(state));
+    const targets = state.lastTargets;
+    const rawDataUrl = await this.overlay.withSuppressed(state.tabId, async () =>
+      await this.ext.tabs.captureVisibleTab(undefined, { format: "png" })
+    );
+    let dataUrl = await sanitizeCapturedDataUrl(
+      this.ext,
+      this.overlay,
+      state.tabId,
+      rawDataUrl
+    );
+    dataUrl = await annotateCapturedDataUrl(dataUrl, options.lastAction, createIncrementingId("shot"));
+    return {
+      url: snapshot.url,
+      title: snapshot.title,
+      viewport: snapshot.viewport,
+      scrollPosition: snapshot.scrollPosition,
+      activeElementId: snapshot.selectionState.activeElementId,
+      accessMode: state.viewState.sessionOptions.accessMode,
+      targets,
+      lastActionSummary: options.lastActionSummary ?? null,
+      lastError: options.lastError ?? null,
+      lastAction: options.lastAction ?? null,
+      screenshotBase64: dataUrl.split(",")[1]
+    };
   }
 
   private async startSession(state: TabSessionState, prompt: string) {
@@ -916,11 +1173,13 @@ class SessionController {
     const startRequest = ModelStartRequestSchema.parse({
       sessionId,
       task: prompt,
-      pageSnapshot,
-      memory: state.memory,
-      feedSummary: summarizeFeed(state.feed),
+      visualContext: await this.captureVisualContext(state),
+      pageSnapshot: undefined,
+      memory: {},
+      feedSummary: "",
       sessionOptions: state.viewState.sessionOptions
     });
+    await this.overlay.sync(state.tabId);
     return await this.fetchImpl(`${AGENT_HTTP}/api/model/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -936,11 +1195,13 @@ class SessionController {
     const requestBody = ModelMessageRequestSchema.parse({
       sessionId,
       prompt,
-      pageSnapshot: state.lastSnapshot ?? undefined,
-      memory: state.memory,
-      feedSummary: summarizeFeed(state.feed),
+      visualContext: await this.captureVisualContext(state),
+      pageSnapshot: undefined,
+      memory: {},
+      feedSummary: "",
       sessionOptions: state.viewState.sessionOptions
     });
+    await this.overlay.sync(state.tabId);
     return await this.fetchImpl(`${AGENT_HTTP}/api/model/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -987,17 +1248,23 @@ export class BrowserControlBackground {
   private readonly sessions: SessionController;
   private readonly tools: ToolExecutionController;
   private readonly fetchImpl: FetchLike;
+  private readonly runtimeManager: ExtensionRuntimeManager;
 
   constructor(private readonly ext: ExtensionApi, fetchImpl?: FetchLike) {
     this.fetchImpl =
       fetchImpl ??
       ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
         fetch(input, init));
-    this.overlay = new OverlayController(ext, (tabId) => this.ensureTabState(tabId), (tabId) =>
-      this.overlay.sync(tabId)
+    this.runtimeManager = new ExtensionRuntimeManager(ext, this.fetchImpl);
+    this.overlay = new OverlayController(
+      ext,
+      (tabId) => this.ensureTabState(tabId),
+      (tabId) => this.overlay.sync(tabId),
+      this.runtimeManager
     );
     this.tools = new ToolExecutionController(ext, this.overlay);
     this.sessions = new SessionController(
+      ext,
       (tabId) => this.ensureTabState(tabId),
       this.overlay,
       this.tools,
@@ -1006,6 +1273,7 @@ export class BrowserControlBackground {
   }
 
   start() {
+    void this.runtimeManager.refreshIfNeeded(true);
     this.ext.runtime.onMessage.addListener((message, sender) =>
       this.handleRuntimeMessage(message, sender)
     );
@@ -1089,9 +1357,9 @@ export class BrowserControlBackground {
     return {
       tabId,
       feed: [],
-      memory: {},
       models,
       lastSnapshot: null,
+      lastTargets: [],
       viewState: await this.overlay.createInitialViewState(models),
       pauseRequested: false,
       busy: false,
@@ -1141,8 +1409,8 @@ function appendFeedItem(
 
 function resetSession(state: TabSessionState) {
   state.feed = [];
-  state.memory = {};
   state.lastSnapshot = null;
+  state.lastTargets = [];
   resetRunState(state);
   state.viewState.pendingActivity = false;
   state.viewState.taskState = "idle";
@@ -1157,11 +1425,48 @@ function resetRunState(state: TabSessionState) {
   state.pendingContinuation = null;
 }
 
-function summarizeFeed(feed: OverlayFeedItem[]) {
-  return feed
-    .slice(-12)
-    .map((item) => [item.kind.toUpperCase(), item.title, item.body].filter(Boolean).join(": "))
-    .join("\n");
+function formatToolCallBody(summary: string, args: Record<string, unknown>) {
+  const trimmedArgs = JSON.stringify(args);
+  if (!trimmedArgs || trimmedArgs === "{}") {
+    return summary;
+  }
+  return `${summary}\nargs=${truncateFeedText(trimmedArgs, 180)}`;
+}
+
+function formatToolResultBody(toolResult: ToolResult) {
+  const segments = [
+    truncateFeedText(toolResult.message, 140)
+  ];
+  if (toolResult.actionFeedback?.resolvedLabel || toolResult.actionFeedback?.resolvedTag) {
+    segments.push(
+      `target=${truncateFeedText(
+        [
+          toolResult.actionFeedback.resolvedLabel,
+          toolResult.actionFeedback.resolvedTag
+        ]
+          .filter(Boolean)
+          .join(" "),
+        80
+      )}`
+    );
+  }
+  if (toolResult.actionFeedback?.point) {
+    segments.push(
+      `point=(${Math.round(toolResult.actionFeedback.point.x)},${Math.round(toolResult.actionFeedback.point.y)})`
+    );
+  }
+  if (toolResult.targets) {
+    segments.push(`targets=${toolResult.targets.length}`);
+  }
+  return segments.join("\n");
+}
+
+function truncateFeedText(value: string, maxLength: number) {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 async function waitForTabUpdate(ext: ExtensionApi, tabId: number, timeoutMs = 2500) {
@@ -1228,6 +1533,103 @@ async function waitForPotentialNavigation(
   });
 }
 
+function delay(timeoutMs: number) {
+  return new Promise((resolve) => setTimeout(resolve, timeoutMs));
+}
+
+async function sanitizeCapturedDataUrl(
+  ext: ExtensionApi,
+  overlay: OverlayController,
+  tabId: number,
+  dataUrl: string
+) {
+  const overlayBounds = await overlay.getVisibleBounds(tabId);
+  if (!overlayBounds) {
+    return dataUrl;
+  }
+
+  try {
+    const sanitized = (await ext.tabs.sendMessage(tabId, {
+      kind: "sanitize_capture",
+      dataUrl,
+      overlayBounds
+    } satisfies ContentSanitizeCaptureMessage)) as string | undefined;
+    return typeof sanitized === "string" && sanitized.startsWith("data:image/")
+      ? sanitized
+      : dataUrl;
+  } catch {
+    return dataUrl;
+  }
+}
+
+function mergeActionFeedback(
+  feedback: ActionFeedback | undefined,
+  patch: Partial<ActionFeedback>
+): ActionFeedback | undefined {
+  if (!feedback && !patch.toolName) {
+    return undefined;
+  }
+  return {
+    toolName: patch.toolName ?? feedback?.toolName ?? "click_coords",
+    targetId: patch.targetId ?? feedback?.targetId ?? null,
+    point: patch.point ?? feedback?.point ?? null,
+    resolvedTag: patch.resolvedTag ?? feedback?.resolvedTag ?? null,
+    resolvedRole: patch.resolvedRole ?? feedback?.resolvedRole ?? null,
+    resolvedLabel: patch.resolvedLabel ?? feedback?.resolvedLabel ?? null,
+    usedFallback: patch.usedFallback ?? feedback?.usedFallback ?? false,
+    navigationOccurred:
+      patch.navigationOccurred ?? feedback?.navigationOccurred ?? false
+  };
+}
+
+async function annotateCapturedDataUrl(
+  dataUrl: string,
+  action: ActionFeedback | null | undefined,
+  shotId: string
+) {
+  if (!action?.point) {
+    return dataUrl;
+  }
+
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load captured image."));
+    img.src = dataUrl;
+  });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return dataUrl;
+  }
+
+  context.drawImage(image, 0, 0);
+  const x = Math.round(action.point.x);
+  const y = Math.round(action.point.y);
+
+  context.strokeStyle = "rgba(24, 174, 255, 0.98)";
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(x, y, 10, 0, Math.PI * 2);
+  context.stroke();
+
+  context.fillStyle = "rgba(24, 174, 255, 0.98)";
+  context.beginPath();
+  context.arc(x, y, 4, 0, Math.PI * 2);
+  context.fill();
+
+  context.fillStyle = "rgba(16, 21, 29, 0.88)";
+  context.fillRect(12, 12, 92, 24);
+  context.fillStyle = "#ffffff";
+  context.font = "12px monospace";
+  context.fillText(shotId, 18, 28);
+
+  return canvas.toDataURL("image/png");
+}
+
 function isInjectableUrl(url?: string) {
   return Boolean(url && /^https?:/i.test(url));
 }
@@ -1236,13 +1638,65 @@ function toErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
-function getExtensionApi(): ExtensionApi | null {
+function formatRuntimeVersion(version: string) {
+  return version.startsWith("remote:") ? version.slice("remote:".length) : version;
+}
+
+function parseExtensionRuntimePayload(payload: unknown): ExtensionRuntimePayload {
+  const record = payload as Record<string, unknown> | null;
+  if (
+    !record ||
+    record.ok !== true ||
+    typeof record.version !== "string" ||
+    typeof record.generatedAt !== "string" ||
+    typeof record.contentScript !== "string" ||
+    typeof record.overlayCss !== "string"
+  ) {
+    throw new Error("Invalid extension runtime payload.");
+  }
+
+  return {
+    ok: true,
+    version: record.version,
+    generatedAt: record.generatedAt,
+    contentScript: record.contentScript,
+    overlayCss: record.overlayCss
+  };
+}
+
+function parseStoredExtensionRuntime(
+  payload: Record<string, unknown> | undefined
+): StoredExtensionRuntime | null {
+  if (
+    !payload ||
+    typeof payload.version !== "string" ||
+    typeof payload.generatedAt !== "string" ||
+    typeof payload.contentScript !== "string" ||
+    typeof payload.overlayCss !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    version: payload.version,
+    generatedAt: payload.generatedAt,
+    contentScript: payload.contentScript,
+    overlayCss: payload.overlayCss
+  };
+}
+
+export function getExtensionApi(): ExtensionApi | null {
   const globalRecord = globalThis as Record<string, unknown>;
   const candidate = globalRecord.browser ?? globalRecord.chrome;
   return candidate ? (candidate as ExtensionApi) : null;
 }
 
-const ext = getExtensionApi();
-if (ext) {
-  new BrowserControlBackground(ext).start();
+export function bootBackground(ext = getExtensionApi()) {
+  if (!ext) {
+    return null;
+  }
+
+  const background = new BrowserControlBackground(ext);
+  background.start();
+  return background;
 }

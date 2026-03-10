@@ -4,4 +4,5 @@ dist
 coverage
 *.log
 openai-codex-*.tgz
-
+apps/extension-firefox/dist
+apps/extension-firefox/build

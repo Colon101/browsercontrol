@@ -1,5 +1,18 @@
-import { buildFailure, buildSuccess, validateToolArgs } from "../../../packages/browser-tools/src/index.js";
-import type { BrowserToolName } from "../../../packages/shared/src/index.js";
+import {
+  buildFailure,
+  buildSuccess,
+  validateToolArgs
+} from "../../../packages/browser-tools/src/index.js";
+import type {
+  ActionFeedback,
+  BrowserToolName,
+  InteractionTarget,
+  PageSnapshot,
+  ToolResult
+} from "../../../packages/shared/src/index.js";
+
+const STABLE_ID_ATTR = "data-browsercontrol-id";
+const TARGET_ID_ATTR = "data-browsercontrol-target-id";
 
 function cssPathFor(element: Element) {
   const parts: string[] = [];
@@ -16,14 +29,24 @@ function cssPathFor(element: Element) {
   return ["body", ...parts].join(" > ");
 }
 
+function normalizeText(value: string | null | undefined) {
+  return value?.replace(/\s+/g, " ").trim() ?? "";
+}
+
 function ensureElementId(element: Element) {
-  const existing = element.getAttribute("data-browsercontrol-id");
+  const existing = element.getAttribute(STABLE_ID_ATTR);
   if (existing) {
     return existing;
   }
   const seed = `${element.tagName.toLowerCase()}-${Math.random().toString(36).slice(2, 10)}`;
-  element.setAttribute("data-browsercontrol-id", seed);
+  element.setAttribute(STABLE_ID_ATTR, seed);
   return seed;
+}
+
+function clearTargetIds() {
+  for (const element of Array.from(document.querySelectorAll(`[${TARGET_ID_ATTR}]`))) {
+    element.removeAttribute(TARGET_ID_ATTR);
+  }
 }
 
 function getInteractiveCandidates() {
@@ -37,24 +60,141 @@ function getInteractiveCandidates() {
         "textarea",
         "[role='button']",
         "[role='link']",
+        "[role='tab']",
+        "[role='menuitem']",
         "[tabindex]"
       ].join(",")
     )
   );
 }
 
+function isVisibleElement(element: HTMLElement) {
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.bottom >= 0 &&
+    rect.right >= 0 &&
+    rect.top <= window.innerHeight &&
+    rect.left <= window.innerWidth &&
+    style.visibility !== "hidden" &&
+    style.display !== "none" &&
+    style.pointerEvents !== "none"
+  );
+}
+
+function getElementLabel(element: HTMLElement) {
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+  ) {
+    return normalizeText(
+      element.getAttribute("aria-label") ||
+        document.querySelector(`label[for="${element.id}"]`)?.textContent ||
+        element.getAttribute("placeholder") ||
+        element.name ||
+        element.value
+    );
+  }
+
+  return normalizeText(
+    element.getAttribute("aria-label") ||
+      element.getAttribute("title") ||
+      element.textContent
+  );
+}
+
+function getElementCenter(element: HTMLElement) {
+  const rect = element.getBoundingClientRect();
+  return {
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2
+  };
+}
+
+function inferTargetKind(element: HTMLElement): InteractionTarget["kind"] {
+  if (element instanceof HTMLAnchorElement || element.getAttribute("role") === "link") {
+    return "link";
+  }
+  if (element instanceof HTMLButtonElement || element.getAttribute("role") === "button") {
+    return "button";
+  }
+  if (element instanceof HTMLInputElement) {
+    if (element.type === "checkbox") {
+      return "checkbox";
+    }
+    if (element.type === "radio") {
+      return "radio";
+    }
+    return "input";
+  }
+  if (element instanceof HTMLTextAreaElement) {
+    return "textarea";
+  }
+  if (element instanceof HTMLSelectElement) {
+    return "select";
+  }
+  if (element.getAttribute("role") === "tab") {
+    return "tab";
+  }
+  if (element.getAttribute("role") === "menuitem") {
+    return "menuitem";
+  }
+  return "other";
+}
+
+function collectInteractionTargets() {
+  clearTargetIds();
+  const elements = getInteractiveCandidates()
+    .filter((element, index, list) => list.indexOf(element) === index)
+    .filter((element) => isVisibleElement(element))
+    .sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
+    });
+
+  return elements.map((element, index) => {
+    const rect = element.getBoundingClientRect();
+    const targetId = `t${index + 1}`;
+    element.setAttribute(TARGET_ID_ATTR, targetId);
+    ensureElementId(element);
+    return {
+      id: targetId,
+      name: getElementLabel(element) || element.tagName.toLowerCase(),
+      role: element.getAttribute("role"),
+      kind: inferTargetKind(element),
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+      enabled: !(element as HTMLInputElement).disabled,
+      selected:
+        element.getAttribute("aria-selected") === "true" ||
+        element.getAttribute("aria-current") === "true",
+      valueHint:
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement
+          ? normalizeText(element.value).slice(0, 80) || null
+          : null
+    } satisfies InteractionTarget;
+  });
+}
+
 function serializeElement(element: HTMLElement) {
   const rect = element.getBoundingClientRect();
-  const label =
-    element.getAttribute("aria-label") ||
-    document.querySelector(`label[for="${element.id}"]`)?.textContent ||
-    null;
   return {
     elementId: ensureElementId(element),
-    tag: element instanceof HTMLInputElement ? `input:${element.type || "text"}` : element.tagName.toLowerCase(),
+    tag:
+      element instanceof HTMLInputElement
+        ? `input:${element.type || "text"}`
+        : element.tagName.toLowerCase(),
     role: element.getAttribute("role"),
-    label: label?.trim() || null,
-    text: element.textContent?.trim() || null,
+    label: getElementLabel(element) || null,
+    text: normalizeText(element.textContent) || null,
     selectorHints: [cssPathFor(element), element.id ? `#${element.id}` : ""].filter(Boolean),
     bbox: {
       x: rect.x,
@@ -73,7 +213,7 @@ function serializeElement(element: HTMLElement) {
   };
 }
 
-export function collectPageSnapshot() {
+export function collectPageSnapshot(): PageSnapshot {
   const interactiveElements = getInteractiveCandidates().map(serializeElement);
   const forms = Array.from(
     document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
@@ -85,11 +225,14 @@ export function collectPageSnapshot() {
       field.getAttribute("aria-label") ||
       document.querySelector(`label[for="${field.id}"]`)?.textContent?.trim() ||
       null,
-    type: field instanceof HTMLSelectElement ? "select" : field.type || field.tagName.toLowerCase(),
+    type:
+      field instanceof HTMLSelectElement ? "select" : field.type || field.tagName.toLowerCase(),
     value: "value" in field ? field.value : null,
     checked: field instanceof HTMLInputElement ? field.checked : null
   }));
-  const textBlocks = Array.from(document.querySelectorAll<HTMLElement>("p, li, h1, h2, h3, article, section"))
+  const textBlocks = Array.from(
+    document.querySelectorAll<HTMLElement>("p, li, h1, h2, h3, article, section")
+  )
     .slice(0, 80)
     .map((node, index) => {
       const rect = node.getBoundingClientRect();
@@ -107,7 +250,8 @@ export function collectPageSnapshot() {
     .filter((item) => item.text);
 
   const selection = window.getSelection();
-  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const activeElement =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
   return {
     url: window.location.href,
@@ -130,160 +274,400 @@ export function collectPageSnapshot() {
   };
 }
 
-function lookupElement(elementId: string) {
-  const found = document.querySelector<HTMLElement>(`[data-browsercontrol-id="${elementId}"]`);
+function collectState() {
+  const targets = collectInteractionTargets();
+  return {
+    targets,
+    pageSnapshot: collectPageSnapshot()
+  };
+}
+
+function lookupTarget(targetId: string) {
+  const found = document.querySelector<HTMLElement>(`[${TARGET_ID_ATTR}="${targetId}"]`);
   if (!found) {
-    throw new Error(`Element not found: ${elementId}`);
+    throw new Error(`Target not found: ${targetId}`);
   }
   return found;
+}
+
+function buildActionFeedback(
+  toolName: ActionFeedback["toolName"],
+  target: HTMLElement | null,
+  point?: { x: number; y: number } | null,
+  partial?: Partial<ActionFeedback>
+): ActionFeedback {
+  return {
+    toolName,
+    targetId: target?.getAttribute(TARGET_ID_ATTR) ?? partial?.targetId ?? null,
+    point: point ?? partial?.point ?? null,
+    resolvedTag: target?.tagName.toLowerCase() ?? partial?.resolvedTag ?? null,
+    resolvedRole: target?.getAttribute("role") ?? partial?.resolvedRole ?? null,
+    resolvedLabel: target ? getElementLabel(target) || null : partial?.resolvedLabel ?? null,
+    usedFallback: partial?.usedFallback ?? false,
+    navigationOccurred: partial?.navigationOccurred ?? false
+  };
+}
+
+function buildToolResult(
+  message: string,
+  options: {
+    data?: unknown;
+    actionFeedback?: ActionFeedback;
+  } = {}
+): ToolResult {
+  const state = collectState();
+  return {
+    ...buildSuccess(message, options.data, state.pageSnapshot),
+    targets: state.targets,
+    actionFeedback: options.actionFeedback
+  };
+}
+
+async function runClickInSameTab(target: HTMLElement, x: number, y: number) {
+  const anchor = target.closest("a[href]") as HTMLAnchorElement | null;
+  const previousTarget = anchor?.getAttribute("target");
+  let restoreTarget = false;
+  if (anchor && previousTarget === "_blank") {
+    anchor.setAttribute("target", "_self");
+    restoreTarget = true;
+  }
+
+  const previousWindowOpen = window.open;
+  window.open = ((url?: string | URL | undefined) => {
+    if (typeof url === "string" && url) {
+      window.location.assign(url);
+    } else if (url instanceof URL) {
+      window.location.assign(url.toString());
+    }
+    return window;
+  }) as typeof window.open;
+
+  try {
+    target.focus?.();
+    dispatchMouseSequence(target, x, y);
+    if ("click" in target && typeof target.click === "function") {
+      target.click();
+    }
+  } finally {
+    window.open = previousWindowOpen;
+    if (anchor && restoreTarget) {
+      if (previousTarget == null) {
+        anchor.removeAttribute("target");
+      } else {
+        anchor.setAttribute("target", previousTarget);
+      }
+    }
+  }
+}
+
+function getTargetPoint(target: HTMLElement) {
+  const center = getElementCenter(target);
+  return {
+    x: center.x,
+    y: center.y
+  };
+}
+
+async function clickTarget(targetId: string) {
+  const target = lookupTarget(targetId);
+  const point = getTargetPoint(target);
+  const previousUrl = window.location.href;
+  await runClickInSameTab(target, point.x, point.y);
+  await waitForPaint();
+  return buildToolResult("Clicked target.", {
+    actionFeedback: buildActionFeedback("click_target", target, point, {
+      navigationOccurred: previousUrl !== window.location.href
+    })
+  });
+}
+
+async function clickCoords(x: number, y: number) {
+  const target = document.elementFromPoint(x, y);
+  if (!(target instanceof HTMLElement)) {
+    throw new Error(`No target found at (${Math.round(x)}, ${Math.round(y)}).`);
+  }
+  const previousUrl = window.location.href;
+  await runClickInSameTab(target, x, y);
+  await waitForPaint();
+  return buildToolResult("Clicked coordinates.", {
+    actionFeedback: buildActionFeedback("click_coords", target, { x, y }, {
+      usedFallback: true,
+      navigationOccurred: previousUrl !== window.location.href
+    })
+  });
+}
+
+async function typeTarget(targetId: string, text: string, append: boolean) {
+  const target = lookupTarget(targetId);
+  if (
+    !(target instanceof HTMLInputElement) &&
+    !(target instanceof HTMLTextAreaElement) &&
+    !(target instanceof HTMLElement && target.isContentEditable)
+  ) {
+    throw new Error(`Target is not editable: ${targetId}`);
+  }
+
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    target.focus();
+    target.value = append ? `${target.value}${text}` : text;
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+  } else {
+    target.focus();
+    target.textContent = append ? `${target.textContent ?? ""}${text}` : text;
+    target.dispatchEvent(
+      new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })
+    );
+  }
+
+  await waitForPaint();
+  return buildToolResult("Updated target value.", {
+    actionFeedback: buildActionFeedback("type_target", target, getTargetPoint(target))
+  });
+}
+
+async function setCheckboxTarget(targetId: string, checked: boolean) {
+  const target = lookupTarget(targetId);
+  if (!(target instanceof HTMLInputElement) || target.type !== "checkbox") {
+    throw new Error(`Target is not a checkbox: ${targetId}`);
+  }
+  target.focus();
+  target.checked = checked;
+  target.dispatchEvent(new Event("input", { bubbles: true }));
+  target.dispatchEvent(new Event("change", { bubbles: true }));
+  await waitForPaint();
+  return buildToolResult("Updated checkbox state.", {
+    actionFeedback: buildActionFeedback(
+      "set_checkbox_target",
+      target,
+      getTargetPoint(target)
+    )
+  });
+}
+
+async function selectOptionTarget(targetId: string, valueOrLabel: string) {
+  const target = lookupTarget(targetId);
+  if (!(target instanceof HTMLSelectElement)) {
+    throw new Error(`Target is not a select element: ${targetId}`);
+  }
+
+  const option = Array.from(target.options).find(
+    (item) =>
+      item.value === valueOrLabel ||
+      item.label.toLowerCase() === valueOrLabel.toLowerCase()
+  );
+  if (!option) {
+    throw new Error(`Option not found: ${valueOrLabel}`);
+  }
+
+  target.focus();
+  target.value = option.value;
+  target.dispatchEvent(new Event("input", { bubbles: true }));
+  target.dispatchEvent(new Event("change", { bubbles: true }));
+  await waitForPaint();
+  return buildToolResult("Updated selected option.", {
+    actionFeedback: buildActionFeedback(
+      "select_option_target",
+      target,
+      getTargetPoint(target)
+    )
+  });
+}
+
+async function scrollViewport(directionOrPixels: "up" | "down" | "top" | "bottom" | number) {
+  if (typeof directionOrPixels === "number") {
+    window.scrollBy({ top: directionOrPixels, behavior: "smooth" });
+  } else {
+    const map = {
+      up: -window.innerHeight * 0.8,
+      down: window.innerHeight * 0.8,
+      top: -window.scrollY,
+      bottom: document.body.scrollHeight
+    };
+    window.scrollBy({ top: map[directionOrPixels], behavior: "smooth" });
+  }
+  await waitForIdle(250);
+  return buildToolResult("Scrolled viewport.", {
+    actionFeedback: {
+      toolName: "scroll_viewport",
+      targetId: null,
+      point: null,
+      resolvedTag: null,
+      resolvedRole: null,
+      resolvedLabel: null,
+      usedFallback: false,
+      navigationOccurred: false
+    }
+  });
+}
+
+async function pressKey(key: string) {
+  const target =
+    document.activeElement instanceof HTMLElement ? document.activeElement : document.body;
+  const eventInit = {
+    key,
+    bubbles: true,
+    cancelable: true
+  } satisfies KeyboardEventInit;
+
+  const proceed = target.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+  target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
+  target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+
+  if (proceed && key === "Enter") {
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+      target.form?.requestSubmit();
+    } else if (target instanceof HTMLButtonElement) {
+      target.click();
+    }
+  }
+
+  await waitForPaint();
+  return buildToolResult(`Pressed ${key}.`, {
+    actionFeedback: buildActionFeedback("press_key", target, null)
+  });
+}
+
+async function inspectTarget(targetId: string) {
+  const target = lookupTarget(targetId);
+  const data = {
+    html: target.outerHTML,
+    text: target.innerText,
+    value:
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement
+        ? target.value
+        : null,
+    selectorHints: [cssPathFor(target), target.id ? `#${target.id}` : ""].filter(Boolean)
+  };
+  return buildToolResult("Inspected target.", { data });
+}
+
+async function extractText(query?: string) {
+  const text = document.body.innerText;
+  const lines = query
+    ? text
+        .split("\n")
+        .filter((line) => line.toLowerCase().includes(query.toLowerCase()))
+        .slice(0, 30)
+    : text.split("\n").slice(0, 60);
+  return buildToolResult("Extracted page text.", {
+    data: {
+      lines
+    }
+  });
+}
+
+async function waitForCondition(
+  condition: { kind: "url_includes" | "selector_exists" | "text_includes"; value: string },
+  timeoutMs: number
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (matchesCondition(condition.kind, condition.value)) {
+      return buildToolResult("Wait condition satisfied.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return buildFailure("wait_timeout", "Timed out waiting for page condition.");
 }
 
 export async function runPageTool(toolName: BrowserToolName, args: unknown) {
   try {
     switch (toolName) {
       case "get_page_snapshot":
-        return buildSuccess("Collected page snapshot.", undefined, collectPageSnapshot());
-      case "get_interactive_elements": {
-        const parsed = validateToolArgs("get_interactive_elements", args);
-        const snapshot = collectPageSnapshot();
-        const filtered = parsed.filter
-          ? snapshot.interactiveElements.filter((item) =>
-              `${item.label ?? ""} ${item.text ?? ""} ${item.tag}`
-                .toLowerCase()
-                .includes(parsed.filter!.toLowerCase())
-            )
-          : snapshot.interactiveElements;
-        return buildSuccess("Collected interactive elements.", filtered, snapshot);
+        return buildToolResult("Collected page snapshot.");
+      case "click_target": {
+        const parsed = validateToolArgs("click_target", args);
+        return await clickTarget(parsed.targetId);
       }
-      case "get_element_details": {
-        const parsed = validateToolArgs("get_element_details", args);
-        const element = lookupElement(parsed.elementId);
-        return buildSuccess(
-          "Collected element details.",
-          {
-            html: element.outerHTML,
-            text: element.innerText,
-            value: (element as HTMLInputElement).value ?? null
-          },
-          collectPageSnapshot()
-        );
+      case "click_coords": {
+        const parsed = validateToolArgs("click_coords", args);
+        return await clickCoords(parsed.x, parsed.y);
       }
-      case "extract_text": {
-        const parsed = validateToolArgs("extract_text", args);
-        const text = document.body.innerText;
-        const result = parsed.query
-          ? text
-              .split("\n")
-              .filter((line) => line.toLowerCase().includes(parsed.query!.toLowerCase()))
-              .slice(0, 30)
-          : text.split("\n").slice(0, 80);
-        return buildSuccess("Extracted page text.", { lines: result }, collectPageSnapshot());
+      case "type_target": {
+        const parsed = validateToolArgs("type_target", args);
+        return await typeTarget(parsed.targetId, parsed.text, parsed.append);
       }
-      case "get_form_state":
-        return buildSuccess("Collected form state.", collectPageSnapshot().forms, collectPageSnapshot());
-      case "click_element": {
-        const parsed = validateToolArgs("click_element", args);
-        const element = lookupElement(parsed.elementId);
-        element.click();
-        await waitForPaint();
-        return buildSuccess("Clicked element.", undefined, collectPageSnapshot());
+      case "set_checkbox_target": {
+        const parsed = validateToolArgs("set_checkbox_target", args);
+        return await setCheckboxTarget(parsed.targetId, parsed.checked);
       }
-      case "type_into": {
-        const parsed = validateToolArgs("type_into", args);
-        const field = lookupElement(parsed.elementId) as HTMLInputElement | HTMLTextAreaElement;
-        field.focus();
-        field.value = parsed.append ? `${field.value}${parsed.text}` : parsed.text;
-        field.dispatchEvent(new Event("input", { bubbles: true }));
-        field.dispatchEvent(new Event("change", { bubbles: true }));
-        await waitForPaint();
-        return buildSuccess("Updated field value.", undefined, collectPageSnapshot());
+      case "select_option_target": {
+        const parsed = validateToolArgs("select_option_target", args);
+        return await selectOptionTarget(parsed.targetId, parsed.valueOrLabel);
       }
-      case "set_checkbox": {
-        const parsed = validateToolArgs("set_checkbox", args);
-        const field = lookupElement(parsed.elementId) as HTMLInputElement;
-        field.checked = parsed.checked;
-        field.dispatchEvent(new Event("input", { bubbles: true }));
-        field.dispatchEvent(new Event("change", { bubbles: true }));
-        await waitForPaint();
-        return buildSuccess("Updated checkbox state.", undefined, collectPageSnapshot());
+      case "scroll_viewport": {
+        const parsed = validateToolArgs("scroll_viewport", args);
+        return await scrollViewport(parsed.directionOrPixels);
       }
-      case "select_option": {
-        const parsed = validateToolArgs("select_option", args);
-        const field = lookupElement(parsed.elementId) as HTMLSelectElement;
-        const option = Array.from(field.options).find(
-          (item) =>
-            item.value === parsed.valueOrLabel ||
-            item.label.toLowerCase() === parsed.valueOrLabel.toLowerCase()
-        );
-        if (!option) {
-          return buildFailure("option_not_found", `Option not found: ${parsed.valueOrLabel}`);
-        }
-        field.value = option.value;
-        field.dispatchEvent(new Event("input", { bubbles: true }));
-        field.dispatchEvent(new Event("change", { bubbles: true }));
-        await waitForPaint();
-        return buildSuccess("Updated select value.", undefined, collectPageSnapshot());
-      }
-      case "scroll_page": {
-        const parsed = validateToolArgs("scroll_page", args);
-        if (typeof parsed.directionOrPixels === "number") {
-          window.scrollBy({ top: parsed.directionOrPixels, behavior: "smooth" });
-        } else {
-          const map = {
-            up: -window.innerHeight * 0.8,
-            down: window.innerHeight * 0.8,
-            top: -window.scrollY,
-            bottom: document.body.scrollHeight
-          };
-          window.scrollBy({ top: map[parsed.directionOrPixels], behavior: "smooth" });
-        }
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        return buildSuccess("Scrolled page.", undefined, collectPageSnapshot());
+      case "press_key": {
+        const parsed = validateToolArgs("press_key", args);
+        return await pressKey(parsed.key);
       }
       case "wait_for": {
         const parsed = validateToolArgs("wait_for", args);
-        const started = Date.now();
-        while (Date.now() - started < parsed.timeoutMs) {
-          if (matchesCondition(parsed.condition.kind, parsed.condition.value)) {
-            return buildSuccess("Wait condition satisfied.", undefined, collectPageSnapshot());
-          }
-          await new Promise((resolve) => setTimeout(resolve, 150));
-        }
-        return buildFailure("wait_timeout", "Timed out waiting for page condition.");
+        return await waitForCondition(parsed.condition, parsed.timeoutMs);
       }
-      case "focus_element": {
-        const parsed = validateToolArgs("focus_element", args);
-        lookupElement(parsed.elementId).focus();
-        return buildSuccess("Focused element.", undefined, collectPageSnapshot());
+      case "inspect_target": {
+        const parsed = validateToolArgs("inspect_target", args);
+        return await inspectTarget(parsed.targetId);
+      }
+      case "extract_text": {
+        const parsed = validateToolArgs("extract_text", args);
+        return await extractText(parsed.query);
       }
       case "get_navigation_state":
-        return buildSuccess(
-          "Collected navigation state.",
-          {
+        return buildToolResult("Collected navigation state.", {
+          data: {
             url: window.location.href,
             title: document.title,
             historyLength: window.history.length
-          },
-          collectPageSnapshot()
-        );
-      default:
-        return buildFailure("unsupported_tool", `Unsupported page tool: ${toolName}`);
+          }
+        });
+      case "go_back":
+        return buildFailure("background_only", "go_back must run in the background script.");
     }
   } catch (error) {
-    return buildFailure("tool_failed", error instanceof Error ? error.message : String(error));
+    return buildFailure(
+      "tool_failed",
+      error instanceof Error ? error.message : String(error)
+    );
   }
+}
+
+function dispatchMouseSequence(target: HTMLElement, x: number, y: number) {
+  const mouseInit = {
+    bubbles: true,
+    cancelable: true,
+    clientX: x,
+    clientY: y
+  } satisfies MouseEventInit;
+
+  target.dispatchEvent(new MouseEvent("pointerdown", mouseInit));
+  target.dispatchEvent(new MouseEvent("mousedown", mouseInit));
+  target.dispatchEvent(new MouseEvent("pointerup", mouseInit));
+  target.dispatchEvent(new MouseEvent("mouseup", mouseInit));
+  target.dispatchEvent(new MouseEvent("click", mouseInit));
 }
 
 function matchesCondition(kind: "url_includes" | "selector_exists" | "text_includes", value: string) {
-  if (kind === "url_includes") {
-    return window.location.href.includes(value);
+  switch (kind) {
+    case "url_includes":
+      return window.location.href.includes(value);
+    case "selector_exists":
+      return Boolean(document.querySelector(value));
+    case "text_includes":
+      return document.body.innerText.toLowerCase().includes(value.toLowerCase());
   }
-  if (kind === "selector_exists") {
-    return Boolean(document.querySelector(value));
-  }
-  return document.body.innerText.toLowerCase().includes(value.toLowerCase());
 }
 
-function waitForPaint() {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+async function waitForPaint() {
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+  await waitForIdle(80);
+}
+
+async function waitForIdle(timeoutMs: number) {
+  await new Promise((resolve) => setTimeout(resolve, timeoutMs));
 }

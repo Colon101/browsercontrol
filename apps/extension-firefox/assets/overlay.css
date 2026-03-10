@@ -26,6 +26,62 @@
   text-rendering: optimizeLegibility;
 }
 
+.bc-shell[data-suppressed="true"] {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.bc-click-marker {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  z-index: 2147483646;
+  transform: translate(-50%, -50%);
+}
+
+.bc-click-marker-ring,
+.bc-click-marker-dot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border-radius: 999px;
+  transform: translate(-50%, -50%);
+}
+
+.bc-click-marker-ring {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(24, 174, 255, 0.96);
+  box-shadow: 0 0 0 4px rgba(24, 174, 255, 0.14);
+  background: rgba(24, 174, 255, 0.08);
+}
+
+.bc-click-marker-dot {
+  width: 4px;
+  height: 4px;
+  background: rgba(24, 174, 255, 0.96);
+  box-shadow: 0 0 10px rgba(24, 174, 255, 0.42);
+}
+
+.bc-click-marker[data-active="true"] .bc-click-marker-ring {
+  animation: bc-click-pulse 0.42s ease-out forwards;
+}
+
+@keyframes bc-click-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.72);
+    opacity: 0.92;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1.16);
+    opacity: 0;
+  }
+}
+
 .bc-card {
   position: fixed;
   min-width: 320px;
@@ -48,8 +104,8 @@
 }
 
 .bc-card[data-access-mode="take_control"] {
-  border-color: rgba(73, 148, 255, 0.3);
-  box-shadow: 0 22px 80px rgba(49, 111, 214, 0.22);
+  border-color: rgba(73, 148, 255, 0.2);
+  box-shadow: 0 16px 54px rgba(49, 111, 214, 0.12);
 }
 
 .bc-header {
@@ -412,13 +468,14 @@
 }
 
 .bc-access-button[data-access-mode="take_control"] {
-  border-color: rgba(73, 148, 255, 0.3);
-  background: rgba(73, 148, 255, 0.16);
+  border-color: rgba(73, 148, 255, 0.24);
+  background: rgba(73, 148, 255, 0.12);
   color: #2c7be5;
 }
 
 .bc-access-button[aria-pressed="true"] {
-  box-shadow: 0 0 0 1px rgba(73, 148, 255, 0.28), 0 0 18px rgba(73, 148, 255, 0.35);
+  box-shadow: 0 0 0 1px rgba(73, 148, 255, 0.22), 0 0 10px rgba(73, 148, 255, 0.18);
+  transform: translateY(-1px);
 }
 
 .bc-resize-grip {

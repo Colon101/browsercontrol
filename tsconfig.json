@@ -12,14 +12,11 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node", "vitest/globals"]
+    "types": ["node"]
   },
   "include": [
     "apps/**/*.ts",
     "apps/**/*.js",
-    "packages/**/*.ts",
-    "tests/**/*.ts",
-    "vitest.config.ts"
+    "packages/**/*.ts"
   ]
 }
-
