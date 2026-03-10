@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -17,6 +17,7 @@ import {
   ModelStartRequestSchema,
   ModelTurnResponseSchema,
   ModelsResponseSchema,
+  NextRunIdResponseSchema,
   ModelCancelRequestSchema,
   PROTOCOL_VERSION,
   RuntimeStateResponseSchema,
@@ -24,6 +25,7 @@ import {
   BrowserToolNameSchema,
   createIncrementingId,
   type AccessMode,
+  type InteractionTarget,
   type PageSnapshot,
   type ModelContinueRequest,
   type ModelMessageRequest,
@@ -46,6 +48,7 @@ type ExtensionRuntimeResponse = {
   ok: true;
   version: string;
   generatedAt: string;
+  backgroundScript: string;
   contentScript: string;
   overlayCss: string;
 };
@@ -60,20 +63,30 @@ export async function createAgentServer(
     logger: false
   });
   const activeSessions = new Set<string>();
+  const sessionAliases = new Map<string, string>();
   const enableLogs = options.logger !== false;
 
   await mkdir(dataDir, { recursive: true });
 
   modelAdapter.onEvent((event) => {
     switch (event.type) {
+      case "tool_call":
+        logTool(
+          enableLogs,
+          `${event.sessionId} ${event.toolName} ${truncateForLog(JSON.stringify(event.args), 160)}`
+        );
+        void appendRunLog(dataDir, event.sessionId, `[tool] ${event.toolName} ${JSON.stringify(event.args)}`);
+        break;
       case "progress":
         logInfo(
           enableLogs,
           `model ${event.sessionId} ${truncateForLog(event.summary, 160)}`
         );
+        void appendRunLog(dataDir, event.sessionId, `[model] ${event.summary}`);
         break;
       case "error":
         logError(enableLogs, `model error ${event.sessionId}: ${event.message}`);
+        void appendRunLog(dataDir, event.sessionId, `[error] ${event.message}`);
         break;
     }
   });
@@ -105,6 +118,13 @@ export async function createAgentServer(
     });
   });
 
+  server.get("/api/runs/next-id", async () => {
+    return NextRunIdResponseSchema.parse({
+      ok: true,
+      nextRunId: await getNextRunId(dataDir)
+    });
+  });
+
   server.get("/api/extension/runtime", async (_, reply) => {
     try {
       return await buildExtensionRuntime(cwd);
@@ -121,11 +141,12 @@ export async function createAgentServer(
   server.post("/api/model/start", async (request, reply) => {
     try {
       const parsed = ModelStartRequestSchema.parse(request.body ?? {});
+      const runtimeSessionId = resolveRuntimeSessionId(parsed.sessionId, sessionAliases);
       const body = {
         ...parsed,
         visualContext: await persistVisualContextArtifacts(
           dataDir,
-          parsed.sessionId,
+          runtimeSessionId,
           resolveVisualContext(parsed.visualContext, parsed.pageSnapshot, parsed.sessionOptions.accessMode)
         )
       };
@@ -136,22 +157,38 @@ export async function createAgentServer(
       });
 
       await modelAdapter.startSession({
-        sessionId: body.sessionId,
+        sessionId: runtimeSessionId,
         task,
         cwd
       });
-      activeSessions.add(body.sessionId);
+      activeSessions.add(runtimeSessionId);
       logInfo(
         enableLogs,
-        `start ${body.sessionId} model=${body.sessionOptions.model} effort=${body.sessionOptions.effort} access=${body.sessionOptions.accessMode} task="${truncateForLog(body.task, 120)}"`
+        `start ${runtimeSessionId} model=${body.sessionOptions.model} effort=${body.sessionOptions.effort} access=${body.sessionOptions.accessMode} task="${truncateForLog(body.task, 120)}"`
+      );
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[start] model=${body.sessionOptions.model} effort=${body.sessionOptions.effort} access=${body.sessionOptions.accessMode} task=${JSON.stringify(body.task)}`
+      );
+      logTargetMap(enableLogs, runtimeSessionId, "start", body.visualContext.targets);
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[targets:start] ${JSON.stringify(compactTargetsForLog(body.visualContext.targets))}`
       );
       if (body.visualContext.artifactPath) {
-        logInfo(enableLogs, `start ${body.sessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        logInfo(enableLogs, `start ${runtimeSessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        await appendRunLog(
+          dataDir,
+          runtimeSessionId,
+          `[shot] start ${basename(body.visualContext.artifactPath)}`
+        );
       }
 
       return ModelTurnResponseSchema.parse({
         ok: true,
-        turn: normalizeTurn(await modelAdapter.sendUserMessage(body.sessionId, buildStartPrompt(body), {
+        turn: normalizeTurn(await modelAdapter.sendUserMessage(runtimeSessionId, buildStartPrompt(body), {
           imagePath: body.visualContext.artifactPath
         }))
       });
@@ -168,27 +205,44 @@ export async function createAgentServer(
   server.post("/api/model/continue", async (request, reply) => {
     try {
       const parsed = ModelContinueRequestSchema.parse(request.body ?? {});
+      const runtimeSessionId = resolveRuntimeSessionId(parsed.sessionId, sessionAliases);
       const body = {
         ...parsed,
         visualContext: await persistVisualContextArtifacts(
           dataDir,
-          parsed.sessionId,
+          runtimeSessionId,
           resolveVisualContext(parsed.visualContext, parsed.pageSnapshot, parsed.sessionOptions.accessMode)
         )
       };
-      const toolResult = await persistArtifacts(dataDir, body.sessionId, body.toolResult);
+      const toolResult = await persistArtifacts(dataDir, runtimeSessionId, body.toolResult);
       logInfo(
         enableLogs,
-        `continue ${body.sessionId} call=${body.callId} ok=${toolResult.ok} code=${toolResult.code} message="${truncateForLog(toolResult.message, 120)}"`
+        `continue ${runtimeSessionId} call=${body.callId} ok=${toolResult.ok} code=${toolResult.code} message="${truncateForLog(toolResult.message, 120)}"`
+      );
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[continue] call=${body.callId} ok=${toolResult.ok} code=${toolResult.code} message=${JSON.stringify(toolResult.message)}`
+      );
+      logTargetMap(enableLogs, runtimeSessionId, "continue", body.visualContext.targets);
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[targets:continue] ${JSON.stringify(compactTargetsForLog(body.visualContext.targets))}`
       );
       if (body.visualContext.artifactPath) {
-        logInfo(enableLogs, `continue ${body.sessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        logInfo(enableLogs, `continue ${runtimeSessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        await appendRunLog(
+          dataDir,
+          runtimeSessionId,
+          `[shot] continue ${basename(body.visualContext.artifactPath)}`
+        );
       }
       return ModelTurnResponseSchema.parse({
         ok: true,
         turn: normalizeTurn(
           await modelAdapter.submitToolResult(
-            body.sessionId,
+            runtimeSessionId,
             body.callId,
             buildContinuationPayload(body, toolResult)
           )
@@ -207,29 +261,46 @@ export async function createAgentServer(
   server.post("/api/model/message", async (request, reply) => {
     try {
       const parsed = ModelMessageRequestSchema.parse(request.body ?? {});
+      const runtimeSessionId = resolveRuntimeSessionId(parsed.sessionId, sessionAliases);
       const body = {
         ...parsed,
         visualContext: parsed.visualContext
-          ? await persistVisualContextArtifacts(dataDir, parsed.sessionId, parsed.visualContext)
+          ? await persistVisualContextArtifacts(dataDir, runtimeSessionId, parsed.visualContext)
           : parsed.pageSnapshot
             ? await persistVisualContextArtifacts(
                 dataDir,
-                parsed.sessionId,
+                runtimeSessionId,
                 resolveVisualContext(undefined, parsed.pageSnapshot, parsed.sessionOptions.accessMode)
               )
             : undefined
       };
       logInfo(
         enableLogs,
-        `message ${body.sessionId} prompt="${truncateForLog(body.prompt, 120)}"`
+        `message ${runtimeSessionId} prompt="${truncateForLog(body.prompt, 120)}"`
+      );
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[message] prompt=${JSON.stringify(body.prompt)}`
+      );
+      logTargetMap(enableLogs, runtimeSessionId, "message", body.visualContext?.targets ?? []);
+      await appendRunLog(
+        dataDir,
+        runtimeSessionId,
+        `[targets:message] ${JSON.stringify(compactTargetsForLog(body.visualContext?.targets ?? []))}`
       );
       if (body.visualContext?.artifactPath) {
-        logInfo(enableLogs, `message ${body.sessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        logInfo(enableLogs, `message ${runtimeSessionId} shot=${basename(body.visualContext.artifactPath)}`);
+        await appendRunLog(
+          dataDir,
+          runtimeSessionId,
+          `[shot] message ${basename(body.visualContext.artifactPath)}`
+        );
       }
       return ModelTurnResponseSchema.parse({
         ok: true,
         turn: normalizeTurn(
-          await modelAdapter.sendUserMessage(body.sessionId, buildMessagePrompt(body), {
+          await modelAdapter.sendUserMessage(runtimeSessionId, buildMessagePrompt(body), {
             imagePath: body.visualContext?.artifactPath
           })
         )
@@ -247,9 +318,12 @@ export async function createAgentServer(
   server.post("/api/model/cancel", async (request, reply) => {
     try {
       const body = ModelCancelRequestSchema.parse(request.body ?? {});
-      await modelAdapter.cancelSession(body.sessionId);
-      activeSessions.delete(body.sessionId);
-      logInfo(enableLogs, `cancel ${body.sessionId}`);
+      const runtimeSessionId = resolveRuntimeSessionId(body.sessionId, sessionAliases);
+      await modelAdapter.cancelSession(runtimeSessionId);
+      activeSessions.delete(runtimeSessionId);
+      sessionAliases.delete(body.sessionId);
+      logInfo(enableLogs, `cancel ${runtimeSessionId}`);
+      await appendRunLog(dataDir, runtimeSessionId, "[cancel]");
       return { ok: true };
     } catch (error) {
       logError(enableLogs, `cancel failed: ${toErrorMessage(error)}`);
@@ -281,6 +355,13 @@ export async function createAgentServer(
 }
 
 async function buildExtensionRuntime(cwd: string): Promise<ExtensionRuntimeResponse> {
+  const backgroundRuntimeEntry = join(
+    cwd,
+    "apps",
+    "extension-firefox",
+    "src",
+    "remote-background-entry.ts"
+  );
   const runtimeEntry = join(
     cwd,
     "apps",
@@ -298,7 +379,7 @@ async function buildExtensionRuntime(cwd: string): Promise<ExtensionRuntimeRespo
 
   const [bundleResult, overlayCss] = await Promise.all([
     build({
-      entryPoints: [runtimeEntry],
+      entryPoints: [backgroundRuntimeEntry, runtimeEntry],
       bundle: true,
       write: false,
       platform: "browser",
@@ -310,12 +391,18 @@ async function buildExtensionRuntime(cwd: string): Promise<ExtensionRuntimeRespo
     readFile(overlayCssPath, "utf8")
   ]);
 
-  const contentScript = bundleResult.outputFiles[0]?.text;
-  if (!contentScript) {
+  const outputFiles = new Map(
+    bundleResult.outputFiles.map((file) => [basename(file.path), file.text])
+  );
+  const backgroundScript = outputFiles.get("remote-background-entry.js");
+  const contentScript = outputFiles.get("remote-content-entry.js");
+  if (!backgroundScript || !contentScript) {
     throw new Error("Extension runtime bundle was empty.");
   }
 
   const version = createHash("sha1")
+    .update(backgroundScript)
+    .update("\n")
     .update(contentScript)
     .update("\n")
     .update(overlayCss)
@@ -325,6 +412,7 @@ async function buildExtensionRuntime(cwd: string): Promise<ExtensionRuntimeRespo
     ok: true,
     version,
     generatedAt: new Date().toISOString(),
+    backgroundScript,
     contentScript,
     overlayCss
   };
@@ -356,7 +444,19 @@ function resolveVisualContext(
   } satisfies VisualContext;
 }
 
-function normalizeTurn(turn: ModelTurn | Record<string, unknown>): ModelTurn {
+function normalizeTurn(turn: unknown): ModelTurn {
+  if (typeof turn === "string") {
+    return {
+      kind: "final",
+      summary: summarizeFinalMessage(turn),
+      answer: turn
+    };
+  }
+
+  if (!turn || typeof turn !== "object" || Array.isArray(turn)) {
+    throw new Error("Model returned an invalid turn payload.");
+  }
+
   const record = turn as Record<string, unknown>;
   const rawKind = typeof record.kind === "string" ? record.kind : "";
 
@@ -371,7 +471,10 @@ function normalizeTurn(turn: ModelTurn | Record<string, unknown>): ModelTurn {
   if (rawKind === "tool_call" || hasToolPayload(record)) {
     return {
       kind: "tool_call",
-      callId: typeof record.callId === "string" ? record.callId : "",
+      callId:
+        typeof record.callId === "string" && record.callId.trim()
+          ? record.callId
+          : createIncrementingId("call"),
       summary:
         typeof record.summary === "string" ? record.summary : "Running browser tool.",
       toolName: BrowserToolNameSchema.parse(record.toolName),
@@ -379,7 +482,7 @@ function normalizeTurn(turn: ModelTurn | Record<string, unknown>): ModelTurn {
     };
   }
 
-  return turn as ModelTurn;
+  throw new Error("Model returned a turn without a valid kind or tool.");
 }
 
 function normalizeLegacyArgs(turn: Record<string, unknown>) {
@@ -411,6 +514,16 @@ function hasFinalAnswer(turn: Record<string, unknown>) {
 
 function hasToolPayload(turn: Record<string, unknown>) {
   return typeof turn.toolName === "string";
+}
+
+function resolveRuntimeSessionId(sessionId: string, sessionAliases: Map<string, string>) {
+  const existing = sessionAliases.get(sessionId);
+  if (existing) {
+    return existing;
+  }
+  const runtimeSessionId = sessionId;
+  sessionAliases.set(sessionId, runtimeSessionId);
+  return runtimeSessionId;
 }
 
 function buildStartPrompt(body: ModelStartRequest) {
@@ -619,6 +732,13 @@ function logInfo(enabled: boolean, message: string) {
   console.log(`[agent] ${message}`);
 }
 
+function logTool(enabled: boolean, message: string) {
+  if (!enabled) {
+    return;
+  }
+  console.log(`[tool] ${message}`);
+}
+
 function logError(enabled: boolean, message: string) {
   if (!enabled) {
     return;
@@ -636,6 +756,66 @@ function truncateForLog(value: string, maxLength: number) {
     return trimmed;
   }
   return `${trimmed.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+async function appendRunLog(dataDir: string, sessionId: string, line: string) {
+  const taskDir = join(dataDir, "tasks", sessionId);
+  await mkdir(taskDir, { recursive: true });
+  await writeFile(join(taskDir, "run.log"), `${new Date().toISOString()} ${line}\n`, {
+    flag: "a"
+  });
+}
+
+async function getNextRunId(dataDir: string) {
+  const tasksDir = join(dataDir, "tasks");
+  try {
+    const entries = await readdir(tasksDir, { withFileTypes: true });
+    let maxRun = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const match = /^run-(\d+)$/.exec(entry.name);
+      if (!match) {
+        continue;
+      }
+      maxRun = Math.max(maxRun, Number(match[1]));
+    }
+    return `run-${maxRun + 1}`;
+  } catch {
+    return "run-1";
+  }
+}
+
+function summarizeFinalMessage(message: string) {
+  const line = message
+    .split("\n")
+    .map((item) => item.trim())
+    .find(Boolean);
+  return line ? truncateForLog(line, 120) : "Completed";
+}
+
+function logTargetMap(
+  enabled: boolean,
+  sessionId: string,
+  phase: "start" | "continue" | "message",
+  targets: InteractionTarget[]
+) {
+  if (!enabled) {
+    return;
+  }
+  const preview = compactTargetsForLog(targets);
+  console.log(`[agent] ${phase} ${sessionId} targets=${targets.length} ${JSON.stringify(preview)}`);
+}
+
+function compactTargetsForLog(targets: InteractionTarget[]) {
+  return targets.slice(0, 20).map((target) => ({
+    id: target.id,
+    kind: target.kind,
+    name: truncateForLog(target.name, 48),
+    x: Math.round(target.x),
+    y: Math.round(target.y)
+  }));
 }
 
 async function main() {

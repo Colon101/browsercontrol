@@ -12,7 +12,8 @@
     "build:agent": "node ./scripts/build-agent.mjs",
     "build:extension": "node ./apps/extension-firefox/build.mjs",
     "build:settings": "node ./apps/settings-ui/build.mjs",
-    "dev": "node --import tsx ./apps/agent/src/index.ts",
+    "dev": "node ./scripts/dev.mjs",
+    "dev:agent": "node --import tsx ./apps/agent/src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

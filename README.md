@@ -17,7 +17,23 @@ Local-first Firefox browser control harness with a ChatMock-backed decision loop
 npm install
 ```
 
-Set the ChatMock base URL before starting the agent:
+`npm run dev` now bootstraps the local model path automatically:
+
+```bash
+npm run dev
+```
+
+On the first run it will:
+
+- build the packaged Firefox extension files in `apps/extension-firefox/dist/`
+- clone ChatMock into `.vendor/chatmock/`
+- create a local Python virtualenv
+- install ChatMock's Python requirements
+- run `chatmock.py login` if your ChatGPT session is not already configured
+- start ChatMock on `http://127.0.0.1:8000`
+- start the BrowserControl agent on `http://127.0.0.1:4317`
+
+If you want to point BrowserControl at an already-running ChatMock instance, set:
 
 ```bash
 export BROWSERCONTROL_CHATMOCK_BASE_URL=http://127.0.0.1:8000
@@ -58,6 +74,7 @@ After the extension is installed once, the packaged add-on now acts as a bootstr
 - On startup and before reinjection, the background script asks the local agent server for the latest extension runtime bundle.
 - The bundle is cached in `storage.local` and reused if the server is temporarily unavailable.
 - Overlay/content changes in `apps/extension-firefox/src/` and `apps/extension-firefox/assets/overlay.css` are served directly by the agent, so normal iteration no longer requires `npm run build:extension`.
+- Background-script changes still require reloading the temporary add-on in Firefox after `npm run dev` rebuilds the package.
 
 ## Runtime model flow
 

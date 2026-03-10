@@ -36,6 +36,30 @@ export const DEFAULT_MODEL_DESCRIPTORS = [
     defaultEffort: "medium"
   },
   {
+    id: "gpt-5.4",
+    label: "GPT-5.4",
+    supportsEffort: true,
+    defaultEffort: "medium"
+  },
+  {
+    id: "gpt-5.3-codex",
+    label: "GPT-5.3 Codex",
+    supportsEffort: true,
+    defaultEffort: "medium"
+  },
+  {
+    id: "gpt-5.2",
+    label: "GPT-5.2",
+    supportsEffort: true,
+    defaultEffort: "high"
+  },
+  {
+    id: "gpt-5.2-codex",
+    label: "GPT-5.2 Codex",
+    supportsEffort: true,
+    defaultEffort: "medium"
+  },
+  {
     id: "gpt-5",
     label: "GPT-5",
     supportsEffort: true,
@@ -48,10 +72,10 @@ export const DEFAULT_MODEL_DESCRIPTORS = [
     defaultEffort: "medium"
   },
   {
-    id: "gpt-5.1-codex-max",
-    label: "GPT-5.1 Codex Max",
+    id: "gpt-5.1",
+    label: "GPT-5.1",
     supportsEffort: true,
-    defaultEffort: "high"
+    defaultEffort: "medium"
   },
   {
     id: "gpt-5.1-codex",
@@ -60,9 +84,21 @@ export const DEFAULT_MODEL_DESCRIPTORS = [
     defaultEffort: "medium"
   },
   {
+    id: "gpt-5.1-codex-max",
+    label: "GPT-5.1 Codex Max",
+    supportsEffort: true,
+    defaultEffort: "medium"
+  },
+  {
     id: "gpt-5.1-codex-mini",
     label: "GPT-5.1 Codex mini",
-    supportsEffort: true,
+    supportsEffort: false,
+    defaultEffort: "low"
+  },
+  {
+    id: "codex-mini",
+    label: "Codex mini",
+    supportsEffort: false,
     defaultEffort: "low"
   }
 ] satisfies ModelDescriptor[];
@@ -326,6 +362,7 @@ export const OverlayViewStateSchema = z.object({
   taskState: TaskStateSchema,
   sessionOptions: SessionOptionsSchema,
   sessionId: z.string().nullable(),
+  lastAction: ActionFeedbackSchema.nullable().optional(),
   connectionState: z.enum(["checking", "online", "offline"]),
   headerMessage: z.string().nullable()
 });
@@ -419,6 +456,11 @@ export const RuntimeStateResponseSchema = z.object({
   models: z.array(ModelDescriptorSchema)
 });
 
+export const NextRunIdResponseSchema = z.object({
+  ok: z.literal(true),
+  nextRunId: z.string()
+});
+
 export const BackgroundToContentMessageSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("overlay_state"),
@@ -504,18 +546,45 @@ export function createDefaultSessionOptions(
   });
 }
 
+const AUTO_MODEL_PREFERENCES = {
+  high: [
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5-codex"
+  ],
+  medium: [
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex",
+    "gpt-5-codex"
+  ],
+  low: [
+    "gpt-5.1-codex-mini",
+    "codex-mini",
+    "gpt-5.1-codex",
+    "gpt-5-codex"
+  ]
+} satisfies Record<Effort, string[]>;
+
 export function resolveEffectiveModelId(
   model: string,
-  effort: Effort
+  effort: Effort,
+  models: ModelDescriptor[] = DEFAULT_MODEL_DESCRIPTORS
 ): string {
   if (model === "auto") {
-    if (effort === "high") {
-      return "gpt-5.1-codex-max";
+    const modelIds = new Set(models.map((item) => item.id));
+    for (const candidate of AUTO_MODEL_PREFERENCES[effort]) {
+      if (modelIds.has(candidate)) {
+        return candidate;
+      }
     }
-    if (effort === "low") {
-      return "gpt-5.1-codex-mini";
-    }
-    return "gpt-5.1-codex";
+    return (
+      models.find((item) => item.id !== "auto")?.id ??
+      DEFAULT_MODEL_DESCRIPTORS.find((item) => item.id !== "auto")?.id ??
+      "gpt-5.3-codex"
+    );
   }
   return model;
 }

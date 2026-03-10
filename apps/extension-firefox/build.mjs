@@ -15,6 +15,7 @@ await mkdir(buildDir, { recursive: true });
 await build({
   entryPoints: {
     background: join(root, "src/background-entry.ts"),
+    "background-runtime": join(root, "src/remote-background-entry.ts"),
     content: join(root, "src/content-entry.ts")
   },
   bundle: true,
@@ -45,6 +46,8 @@ const zipEntries = {};
 for (const file of [
   "background.js",
   "background.js.map",
+  "background-runtime.js",
+  "background-runtime.js.map",
   "content.js",
   "content.js.map",
   "manifest.json",

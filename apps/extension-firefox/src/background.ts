@@ -4,10 +4,12 @@ import {
   DEFAULT_OVERLAY_POSITION,
   DEFAULT_OVERLAY_SIZE,
   MIN_OVERLAY_SIZE,
+  BrowserToolNameSchema,
   ModelContinueRequestSchema,
   ModelMessageRequestSchema,
   ModelStartRequestSchema,
   ModelsResponseSchema,
+  NextRunIdResponseSchema,
   ModelTurnResponseSchema,
   OverlayIntentSchema,
   SessionOptionsSchema,
@@ -15,7 +17,6 @@ import {
   createDefaultSessionOptions,
   createEnvelopeIds,
   createIncrementingId,
-  createSessionId,
   type AccessMode,
   type ActionFeedback,
   type BackgroundToContentMessage,
@@ -323,6 +324,7 @@ class OverlayController {
       taskState: "idle",
       sessionOptions: createDefaultSessionOptions(models),
       sessionId: null,
+      lastAction: null,
       connectionState: "checking",
       headerMessage: null
     };
@@ -468,14 +470,10 @@ class OverlayController {
 
   async withSuppressed<T>(tabId: number, task: () => Promise<T>) {
     await this.setSuppressed(tabId, true);
-    await this.forceOverlayVisibility(tabId, true);
-    await delay(34);
     try {
       return await task();
     } finally {
-      await this.forceOverlayVisibility(tabId, false);
       await this.setSuppressed(tabId, false);
-      await delay(16);
     }
   }
 
@@ -489,37 +487,6 @@ class OverlayController {
       kind: "set_overlay_suppressed",
       hidden
     } satisfies ContentOverlaySuppressionMessage);
-  }
-
-  private async forceOverlayVisibility(tabId: number, hidden: boolean) {
-    try {
-      await this.ext.tabs.executeScript(tabId, {
-        code: `
-          (() => {
-            const host = document.getElementById("browsercontrol-host");
-            if (!(host instanceof HTMLElement)) return;
-            if (${hidden ? "true" : "false"}) {
-              host.dataset.bcPrevDisplay = host.style.display || "";
-              host.style.setProperty("display", "none", "important");
-              host.style.setProperty("visibility", "hidden", "important");
-              host.style.setProperty("pointer-events", "none", "important");
-              return;
-            }
-            const previous = host.dataset.bcPrevDisplay ?? "";
-            if (previous) {
-              host.style.display = previous;
-            } else {
-              host.style.removeProperty("display");
-            }
-            host.style.removeProperty("visibility");
-            host.style.removeProperty("pointer-events");
-            delete host.dataset.bcPrevDisplay;
-          })();
-        `
-      });
-    } catch {
-      return;
-    }
   }
 
   private createPayload(state: TabSessionState): BackgroundToContentMessage {
@@ -829,7 +796,7 @@ class SessionController {
     const isFollowUp = Boolean(state.viewState.sessionId) && state.viewState.taskState === "completed";
     if (!isFollowUp) {
       resetRunState(state);
-      state.viewState.sessionId = createSessionId();
+      state.viewState.sessionId = await this.requestNextSessionId();
     }
 
     state.viewState.taskState = "starting";
@@ -871,7 +838,7 @@ class SessionController {
         throw new Error(json.error ?? "Unable to start the model session.");
       }
       state.busy = false;
-      const turn = ModelTurnResponseSchema.parse(json).turn;
+      const turn = parseModelTurnResponse(json);
       if (state.pauseRequested) {
         state.pendingTurn = turn;
         this.enterPausedState(state);
@@ -958,6 +925,9 @@ class SessionController {
 
       state.viewState.taskState = "running";
       state.viewState.headerMessage = null;
+      if (turn.kind === "tool_call") {
+        turn = coerceTurnToTargetTurn(turn, state.lastTargets);
+      }
 
       if (turn.kind === "final") {
         appendFeedItem(state, "answer", {
@@ -992,6 +962,7 @@ class SessionController {
         if (toolResult.targets) {
           state.lastTargets = toolResult.targets;
         }
+        state.viewState.lastAction = toolResult.actionFeedback ?? null;
 
         if (toolResult.code === "readonly_blocked") {
           appendFeedItem(state, "warning", {
@@ -1100,6 +1071,9 @@ class SessionController {
       memory: {},
       sessionOptions: state.viewState.sessionOptions
     });
+    if (requestBody.visualContext) {
+      logModelRequest(state, "continue", requestBody.visualContext);
+    }
     await this.overlay.sync(state.tabId);
     const response = await this.fetchImpl(`${AGENT_HTTP}/api/model/continue`, {
       method: "POST",
@@ -1111,7 +1085,7 @@ class SessionController {
     if (!response.ok || !json.ok) {
       throw new Error(json.error ?? "Model returned no actionable turn.");
     }
-    return ModelTurnResponseSchema.parse(json).turn;
+    return parseModelTurnResponse(json);
   }
 
   private async capturePageSnapshot(state: TabSessionState) {
@@ -1148,7 +1122,11 @@ class SessionController {
       state.tabId,
       rawDataUrl
     );
-    dataUrl = await annotateCapturedDataUrl(dataUrl, options.lastAction, createIncrementingId("shot"));
+    dataUrl = await annotateCapturedDataUrl(
+      dataUrl,
+      options.lastAction,
+      createIncrementingId("shot")
+    );
     return {
       url: snapshot.url,
       title: snapshot.title,
@@ -1179,6 +1157,9 @@ class SessionController {
       feedSummary: "",
       sessionOptions: state.viewState.sessionOptions
     });
+    if (startRequest.visualContext) {
+      logModelRequest(state, "start", startRequest.visualContext);
+    }
     await this.overlay.sync(state.tabId);
     return await this.fetchImpl(`${AGENT_HTTP}/api/model/start`, {
       method: "POST",
@@ -1201,6 +1182,9 @@ class SessionController {
       feedSummary: "",
       sessionOptions: state.viewState.sessionOptions
     });
+    if (requestBody.visualContext) {
+      logModelRequest(state, "message", requestBody.visualContext);
+    }
     await this.overlay.sync(state.tabId);
     return await this.fetchImpl(`${AGENT_HTTP}/api/model/message`, {
       method: "POST",
@@ -1238,6 +1222,15 @@ class SessionController {
     state.pendingTurn = null;
     state.pendingContinuation = null;
     state.pauseRequested = false;
+  }
+
+  private async requestNextSessionId() {
+    const response = await this.fetchImpl(`${AGENT_HTTP}/api/runs/next-id`);
+    const json = await response.json();
+    if (!response.ok || !json.ok) {
+      throw new Error(json.error ?? "Unable to allocate the next run id.");
+    }
+    return NextRunIdResponseSchema.parse(json).nextRunId;
   }
 }
 
@@ -1391,6 +1384,167 @@ export class BrowserControlBackground {
   }
 }
 
+function parseModelTurnResponse(json: unknown) {
+  const payload = ModelTurnResponseSchema.safeParse(json);
+  if (payload.success) {
+    return payload.data.turn;
+  }
+
+  const record =
+    json && typeof json === "object" && !Array.isArray(json)
+      ? (json as Record<string, unknown>)
+      : null;
+  if (record?.ok !== true) {
+    throw new Error(
+      typeof record?.error === "string" ? record.error : "Model returned no actionable turn."
+    );
+  }
+
+  return normalizeModelTurn(record.turn);
+}
+
+function normalizeModelTurn(turn: unknown): ModelTurn {
+  if (typeof turn === "string") {
+    return {
+      kind: "final",
+      summary: truncateFeedText(turn, 120) || "Completed",
+      answer: turn
+    };
+  }
+
+  if (!turn || typeof turn !== "object" || Array.isArray(turn)) {
+    throw new Error("Model returned an invalid turn payload.");
+  }
+
+  const record = turn as Record<string, unknown>;
+  if (
+    (record.kind === "final" || typeof record.answer === "string") &&
+    typeof record.answer === "string"
+  ) {
+    return {
+      kind: "final",
+      summary:
+        typeof record.summary === "string" && record.summary.trim()
+          ? record.summary
+          : truncateFeedText(record.answer, 120) || "Completed",
+      answer: record.answer
+    };
+  }
+
+  if (record.kind === "tool_call" || typeof record.toolName === "string") {
+    return {
+      kind: "tool_call",
+      callId:
+        typeof record.callId === "string" && record.callId.trim()
+          ? record.callId
+          : createEnvelopeIds("call").id,
+      summary:
+        typeof record.summary === "string" && record.summary.trim()
+          ? record.summary
+          : "Running browser tool.",
+      toolName: BrowserToolNameSchema.parse(record.toolName),
+      args:
+        typeof record.args === "object" &&
+        record.args !== null &&
+        !Array.isArray(record.args)
+          ? (record.args as Record<string, unknown>)
+          : {}
+    };
+  }
+
+  throw new Error("Model returned a turn without a valid kind or tool.");
+}
+
+function coerceTurnToTargetTurn(
+  turn: Extract<ModelTurn, { kind: "tool_call" }>,
+  targets: InteractionTarget[]
+): Extract<ModelTurn, { kind: "tool_call" }> {
+  if (turn.toolName !== "click_coords" || targets.length === 0) {
+    return turn;
+  }
+
+  const target = findTargetForPoint(turn.args, targets);
+  if (!target) {
+    return turn;
+  }
+
+  console.info(
+    "[BrowserControl] rewrote click_coords to click_target",
+    JSON.stringify({
+      callId: turn.callId,
+      targetId: target.id,
+      name: target.name,
+      x: Math.round(target.x),
+      y: Math.round(target.y)
+    })
+  );
+  return {
+    ...turn,
+    summary: `click_target {"targetId":"${target.id}"}`,
+    toolName: "click_target",
+    args: {
+      targetId: target.id
+    }
+  };
+}
+
+function findTargetForPoint(args: Record<string, unknown>, targets: InteractionTarget[]) {
+  const x = typeof args.x === "number" ? args.x : null;
+  const y = typeof args.y === "number" ? args.y : null;
+  if (x === null || y === null) {
+    return null;
+  }
+
+  const containingTargets = targets.filter(
+    (target) =>
+      x >= target.x &&
+      x <= target.x + target.width &&
+      y >= target.y &&
+      y <= target.y + target.height
+  );
+  if (containingTargets.length > 0) {
+    return containingTargets.sort(
+      (left, right) => left.width * left.height - right.width * right.height
+    )[0]!;
+  }
+
+  const closest = targets
+    .map((target) => ({
+      target,
+      distance: Math.hypot(
+        x - (target.x + target.width / 2),
+        y - (target.y + target.height / 2)
+      )
+    }))
+    .sort((left, right) => left.distance - right.distance)[0];
+
+  return closest && closest.distance <= 24 ? closest.target : null;
+}
+
+function logModelRequest(
+  state: TabSessionState,
+  phase: "start" | "continue" | "message",
+  visualContext: VisualContext
+) {
+  console.info(
+    `[BrowserControl] model ${phase} ${state.viewState.sessionId ?? "run-pending"}`,
+    {
+      url: visualContext.url,
+      title: visualContext.title,
+      targets: visualContext.targets.slice(0, 25).map((target) => ({
+        id: target.id,
+        kind: target.kind,
+        name: truncateFeedText(target.name, 48),
+        x: Math.round(target.x),
+        y: Math.round(target.y),
+        width: Math.round(target.width),
+        height: Math.round(target.height),
+        enabled: target.enabled
+      }))
+    }
+  );
+}
+
 function appendFeedItem(
   state: TabSessionState,
   kind: OverlayFeedItem["kind"],
@@ -1415,6 +1569,7 @@ function resetSession(state: TabSessionState) {
   state.viewState.pendingActivity = false;
   state.viewState.taskState = "idle";
   state.viewState.sessionId = null;
+  state.viewState.lastAction = null;
   state.viewState.headerMessage = null;
 }
 
@@ -1533,10 +1688,6 @@ async function waitForPotentialNavigation(
   });
 }
 
-function delay(timeoutMs: number) {
-  return new Promise((resolve) => setTimeout(resolve, timeoutMs));
-}
-
 async function sanitizeCapturedDataUrl(
   ext: ExtensionApi,
   overlay: OverlayController,
@@ -1587,10 +1738,6 @@ async function annotateCapturedDataUrl(
   action: ActionFeedback | null | undefined,
   shotId: string
 ) {
-  if (!action?.point) {
-    return dataUrl;
-  }
-
   const image = await new Promise<HTMLImageElement>((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
@@ -1607,19 +1754,21 @@ async function annotateCapturedDataUrl(
   }
 
   context.drawImage(image, 0, 0);
-  const x = Math.round(action.point.x);
-  const y = Math.round(action.point.y);
+  if (action?.point) {
+    const x = Math.round(action.point.x);
+    const y = Math.round(action.point.y);
 
-  context.strokeStyle = "rgba(24, 174, 255, 0.98)";
-  context.lineWidth = 2;
-  context.beginPath();
-  context.arc(x, y, 10, 0, Math.PI * 2);
-  context.stroke();
+    context.strokeStyle = "rgba(24, 174, 255, 0.98)";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(x, y, 10, 0, Math.PI * 2);
+    context.stroke();
 
-  context.fillStyle = "rgba(24, 174, 255, 0.98)";
-  context.beginPath();
-  context.arc(x, y, 4, 0, Math.PI * 2);
-  context.fill();
+    context.fillStyle = "rgba(24, 174, 255, 0.98)";
+    context.beginPath();
+    context.arc(x, y, 4, 0, Math.PI * 2);
+    context.fill();
+  }
 
   context.fillStyle = "rgba(16, 21, 29, 0.88)";
   context.fillRect(12, 12, 92, 24);
@@ -1627,7 +1776,22 @@ async function annotateCapturedDataUrl(
   context.font = "12px monospace";
   context.fillText(shotId, 18, 28);
 
-  return canvas.toDataURL("image/png");
+  const maxDimension = 1280;
+  const scale = Math.min(1, maxDimension / Math.max(canvas.width, canvas.height));
+  if (scale >= 1) {
+    return canvas.toDataURL("image/png");
+  }
+
+  const scaledCanvas = document.createElement("canvas");
+  scaledCanvas.width = Math.max(1, Math.round(canvas.width * scale));
+  scaledCanvas.height = Math.max(1, Math.round(canvas.height * scale));
+  const scaledContext = scaledCanvas.getContext("2d");
+  if (!scaledContext) {
+    return canvas.toDataURL("image/png");
+  }
+
+  scaledContext.drawImage(canvas, 0, 0, scaledCanvas.width, scaledCanvas.height);
+  return scaledCanvas.toDataURL("image/png");
 }
 
 function isInjectableUrl(url?: string) {

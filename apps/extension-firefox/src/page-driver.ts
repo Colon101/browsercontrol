@@ -13,6 +13,24 @@ import type {
 
 const STABLE_ID_ATTR = "data-browsercontrol-id";
 const TARGET_ID_ATTR = "data-browsercontrol-target-id";
+const SEMANTIC_INTERACTIVE_SELECTOR = [
+  "a[href]",
+  "button",
+  "input",
+  "select",
+  "textarea",
+  "summary",
+  "[role='button']",
+  "[role='link']",
+  "[role='tab']",
+  "[role='menuitem']",
+  "[contenteditable='true']"
+].join(",");
+const INTERACTIVE_CANDIDATE_SELECTOR = [
+  SEMANTIC_INTERACTIVE_SELECTOR,
+  "[onclick]",
+  "[tabindex]:not([tabindex='-1'])"
+].join(",");
 
 function cssPathFor(element: Element) {
   const parts: string[] = [];
@@ -50,21 +68,8 @@ function clearTargetIds() {
 }
 
 function getInteractiveCandidates() {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>(
-      [
-        "a[href]",
-        "button",
-        "input",
-        "select",
-        "textarea",
-        "[role='button']",
-        "[role='link']",
-        "[role='tab']",
-        "[role='menuitem']",
-        "[tabindex]"
-      ].join(",")
-    )
+  return Array.from(document.querySelectorAll<HTMLElement>(INTERACTIVE_CANDIDATE_SELECTOR)).filter(
+    (element) => isActionableElement(element)
   );
 }
 
@@ -102,8 +107,185 @@ function getElementLabel(element: HTMLElement) {
   return normalizeText(
     element.getAttribute("aria-label") ||
       element.getAttribute("title") ||
+      (element instanceof HTMLAnchorElement ||
+      element instanceof HTMLButtonElement ||
+      element.getAttribute("role") === "tab" ||
+      element.getAttribute("role") === "menuitem"
+        ? element.innerText || element.textContent
+        : getDirectTextContent(element))
+  );
+}
+
+function getDirectTextContent(element: HTMLElement) {
+  return Array.from(element.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent ?? "")
+    .join(" ");
+}
+
+function getReadableText(element: HTMLElement) {
+  return normalizeText(
+    element.getAttribute("aria-label") ||
+      element.getAttribute("title") ||
+      element.innerText ||
       element.textContent
   );
+}
+
+function hasInteractiveRole(element: HTMLElement) {
+  const role = element.getAttribute("role");
+  return role === "button" || role === "link" || role === "tab" || role === "menuitem";
+}
+
+function isSemanticInteractiveElement(element: HTMLElement) {
+  return (
+    element.matches(SEMANTIC_INTERACTIVE_SELECTOR) ||
+    element instanceof HTMLAnchorElement ||
+    element instanceof HTMLButtonElement ||
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLSelectElement ||
+    element instanceof HTMLTextAreaElement
+  );
+}
+
+function hasActionableBehavior(element: HTMLElement) {
+  return (
+    isSemanticInteractiveElement(element) ||
+    hasInteractiveRole(element) ||
+    element.tabIndex >= 0 ||
+    element.isContentEditable ||
+    element.hasAttribute("onclick") ||
+    typeof (element as HTMLElement & { onclick?: unknown }).onclick === "function"
+  );
+}
+
+function hasNestedInteractiveDescendant(element: HTMLElement) {
+  return Array.from(element.querySelectorAll<HTMLElement>(INTERACTIVE_CANDIDATE_SELECTOR)).some(
+    (candidate) => candidate !== element && hasActionableBehavior(candidate)
+  );
+}
+
+function isGenericContainer(element: HTMLElement) {
+  return ["div", "span", "li", "ul", "nav", "section", "article"].includes(
+    element.tagName.toLowerCase()
+  );
+}
+
+function isActionableElement(element: HTMLElement) {
+  if (!hasActionableBehavior(element)) {
+    return false;
+  }
+
+  if (
+    !isSemanticInteractiveElement(element) &&
+    !hasInteractiveRole(element) &&
+    element.tabIndex < 0 &&
+    !element.hasAttribute("onclick")
+  ) {
+    return false;
+  }
+
+  if (isGenericContainer(element) && hasNestedInteractiveDescendant(element)) {
+    return false;
+  }
+
+  if (
+    isGenericContainer(element) &&
+    !hasInteractiveRole(element) &&
+    !element.hasAttribute("onclick") &&
+    !isSemanticInteractiveElement(element) &&
+    getReadableText(element).length > 80
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildTargetRecord(
+  element: HTMLElement,
+  targetId: string,
+  kind?: InteractionTarget["kind"],
+  role?: string | null
+) {
+  const rect = element.getBoundingClientRect();
+  element.setAttribute(TARGET_ID_ATTR, targetId);
+  ensureElementId(element);
+  return {
+    id: targetId,
+    name: getElementLabel(element) || getReadableText(element) || element.tagName.toLowerCase(),
+    role: role ?? element.getAttribute("role"),
+    kind: kind ?? inferTargetKind(element),
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height,
+    enabled: !(element as HTMLInputElement).disabled,
+    selected:
+      element.getAttribute("aria-selected") === "true" ||
+      element.getAttribute("aria-current") === "true",
+    valueHint:
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLSelectElement
+        ? normalizeText(element.value).slice(0, 80) || null
+        : null
+  } satisfies InteractionTarget;
+}
+
+function collectDelegatedChildTargets(element: HTMLElement) {
+  if (!isGenericContainer(element) || !hasActionableBehavior(element)) {
+    return [];
+  }
+
+  const parentRect = element.getBoundingClientRect();
+  const descendants = Array.from(element.querySelectorAll<HTMLElement>("*"))
+    .filter((candidate) => isVisibleElement(candidate))
+    .map((candidate) => ({
+      element: candidate,
+      label: getReadableText(candidate),
+      rect: candidate.getBoundingClientRect()
+    }))
+    .filter(
+      ({ label, rect }) =>
+        label.length > 0 &&
+        label.length <= 80 &&
+        rect.width > 24 &&
+        rect.height > 14 &&
+        rect.width <= parentRect.width + 4 &&
+        rect.height <= Math.max(72, parentRect.height * 0.45)
+    )
+    .filter(
+      ({ rect }) =>
+        rect.left >= parentRect.left - 1 &&
+        rect.right <= parentRect.right + 1 &&
+        rect.top >= parentRect.top - 1 &&
+        rect.bottom <= parentRect.bottom + 1
+    )
+    .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
+
+  const deduped: HTMLElement[] = [];
+  const seen = new Set<string>();
+  for (const { element: candidate, label, rect } of descendants) {
+    const key = `${label}:${Math.round(rect.top)}:${Math.round(rect.left)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    if (
+      deduped.some(
+        (existing) =>
+          existing.contains(candidate) ||
+          candidate.contains(existing) ||
+          getReadableText(existing) === label
+      )
+    ) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(candidate);
+  }
+
+  return deduped.length >= 2 ? deduped : [];
 }
 
 function getElementCenter(element: HTMLElement) {
@@ -156,32 +338,27 @@ function collectInteractionTargets() {
       return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
     });
 
-  return elements.map((element, index) => {
-    const rect = element.getBoundingClientRect();
-    const targetId = `t${index + 1}`;
-    element.setAttribute(TARGET_ID_ATTR, targetId);
-    ensureElementId(element);
-    return {
-      id: targetId,
-      name: getElementLabel(element) || element.tagName.toLowerCase(),
-      role: element.getAttribute("role"),
-      kind: inferTargetKind(element),
-      x: rect.left,
-      y: rect.top,
-      width: rect.width,
-      height: rect.height,
-      enabled: !(element as HTMLInputElement).disabled,
-      selected:
-        element.getAttribute("aria-selected") === "true" ||
-        element.getAttribute("aria-current") === "true",
-      valueHint:
-        element instanceof HTMLInputElement ||
-        element instanceof HTMLTextAreaElement ||
-        element instanceof HTMLSelectElement
-          ? normalizeText(element.value).slice(0, 80) || null
-          : null
-    } satisfies InteractionTarget;
-  });
+  const targets: InteractionTarget[] = [];
+  for (const element of elements) {
+    const delegatedChildren = collectDelegatedChildTargets(element);
+    if (delegatedChildren.length > 0) {
+      for (const child of delegatedChildren) {
+        targets.push(
+          buildTargetRecord(
+            child,
+            `t${targets.length + 1}`,
+            inferTargetKind(element),
+            element.getAttribute("role")
+          )
+        );
+      }
+      continue;
+    }
+
+    targets.push(buildTargetRecord(element, `t${targets.length + 1}`));
+  }
+
+  return targets;
 }
 
 function serializeElement(element: HTMLElement) {
@@ -290,6 +467,29 @@ function lookupTarget(targetId: string) {
   return found;
 }
 
+function findActionableElementAtPoint(x: number, y: number) {
+  const stack =
+    typeof document.elementsFromPoint === "function"
+      ? document.elementsFromPoint(x, y)
+      : [document.elementFromPoint(x, y)].filter(Boolean);
+
+  for (const node of stack) {
+    if (!(node instanceof HTMLElement)) {
+      continue;
+    }
+    const targeted = node.closest<HTMLElement>(`[${TARGET_ID_ATTR}]`);
+    if (targeted) {
+      return targeted;
+    }
+    const actionable = node.closest<HTMLElement>(INTERACTIVE_CANDIDATE_SELECTOR);
+    if (actionable && isActionableElement(actionable)) {
+      return actionable;
+    }
+  }
+
+  return null;
+}
+
 function buildActionFeedback(
   toolName: ActionFeedback["toolName"],
   target: HTMLElement | null,
@@ -382,15 +582,19 @@ async function clickTarget(targetId: string) {
 }
 
 async function clickCoords(x: number, y: number) {
-  const target = document.elementFromPoint(x, y);
+  const target = findActionableElementAtPoint(x, y);
   if (!(target instanceof HTMLElement)) {
     throw new Error(`No target found at (${Math.round(x)}, ${Math.round(y)}).`);
   }
   const previousUrl = window.location.href;
-  await runClickInSameTab(target, x, y);
+  const point =
+    target.hasAttribute(TARGET_ID_ATTR) || isActionableElement(target)
+      ? getTargetPoint(target)
+      : { x, y };
+  await runClickInSameTab(target, point.x, point.y);
   await waitForPaint();
   return buildToolResult("Clicked coordinates.", {
-    actionFeedback: buildActionFeedback("click_coords", target, { x, y }, {
+    actionFeedback: buildActionFeedback("click_coords", target, point, {
       usedFallback: true,
       navigationOccurred: previousUrl !== window.location.href
     })
@@ -630,10 +834,15 @@ export async function runPageTool(toolName: BrowserToolName, args: unknown) {
         return buildFailure("background_only", "go_back must run in the background script.");
     }
   } catch (error) {
-    return buildFailure(
-      "tool_failed",
-      error instanceof Error ? error.message : String(error)
-    );
+    const state = collectState();
+    return {
+      ...buildFailure(
+        "tool_failed",
+        error instanceof Error ? error.message : String(error)
+      ),
+      targets: state.targets,
+      pageSnapshot: state.pageSnapshot
+    } satisfies ToolResult;
   }
 }
 

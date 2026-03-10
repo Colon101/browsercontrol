@@ -93,4 +93,67 @@ describe("page driver", () => {
     expect(result.actionFeedback?.toolName).toBe("type_target");
     expect(result.actionFeedback?.targetId).toBe(inputTarget!.id);
   });
+
+  it("splits delegated container controls into distinct visible targets", async () => {
+    document.body.innerHTML = `
+      <main>
+        <div id="settings-nav" tabindex="0">
+          <div id="general-item">General</div>
+          <div id="connectors-item">Connectors</div>
+          <div id="usage-item">Usage</div>
+          <div id="data-controls-item">Data controls</div>
+        </div>
+      </main>
+    `;
+
+    Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: HTMLElement) {
+        const rects: Record<string, { x: number; y: number; width: number; height: number }> = {
+          "settings-nav": { x: 16, y: 120, width: 220, height: 260 },
+          "general-item": { x: 24, y: 132, width: 120, height: 28 },
+          "connectors-item": { x: 24, y: 190, width: 120, height: 28 },
+          "usage-item": { x: 24, y: 248, width: 120, height: 28 },
+          "data-controls-item": { x: 24, y: 306, width: 140, height: 28 }
+        };
+        const rect = this.id ? rects[this.id] : undefined;
+        if (rect) {
+          return {
+            x: rect.x,
+            y: rect.y,
+            top: rect.y,
+            left: rect.x,
+            right: rect.x + rect.width,
+            bottom: rect.y + rect.height,
+            width: rect.width,
+            height: rect.height,
+            toJSON() {
+              return {};
+            }
+          };
+        }
+        return {
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          width: 0,
+          height: 0,
+          toJSON() {
+            return {};
+          }
+        };
+      }
+    });
+
+    const result = await runPageTool("get_page_snapshot", {});
+    const names = (result.targets ?? []).map((target) => target.name);
+
+    expect(names).toContain("Usage");
+    expect(names).toContain("Connectors");
+    expect(names).toContain("Data controls");
+    expect(names).not.toContain("General Connectors Usage Data controls");
+  });
 });

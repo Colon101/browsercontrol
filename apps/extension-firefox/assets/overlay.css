@@ -7,7 +7,7 @@
   --bc-bg: linear-gradient(180deg, #f6f1e7 0%, #efe6d5 100%);
   --bc-card: rgba(255, 250, 242, 0.98);
   --bc-border: rgba(58, 43, 28, 0.14);
-  --bc-shadow: 0 18px 60px rgba(40, 27, 13, 0.22);
+  --bc-shadow: none;
   --bc-text: #23180f;
   --bc-muted: #6f604f;
   --bc-accent: #0d6b5f;
@@ -43,6 +43,10 @@
   transform: translate(-50%, -50%);
 }
 
+.bc-click-marker[data-visible="false"] {
+  display: none;
+}
+
 .bc-click-marker-ring,
 .bc-click-marker-dot {
   position: absolute;
@@ -56,15 +60,13 @@
   width: 10px;
   height: 10px;
   border: 2px solid rgba(24, 174, 255, 0.96);
-  box-shadow: 0 0 0 4px rgba(24, 174, 255, 0.14);
-  background: rgba(24, 174, 255, 0.08);
+  background: transparent;
 }
 
 .bc-click-marker-dot {
   width: 4px;
   height: 4px;
   background: rgba(24, 174, 255, 0.96);
-  box-shadow: 0 0 10px rgba(24, 174, 255, 0.42);
 }
 
 .bc-click-marker[data-active="true"] .bc-click-marker-ring {
@@ -94,18 +96,13 @@
   padding: 14px;
   border: 1px solid var(--bc-border);
   border-radius: 22px;
-  background:
-    radial-gradient(circle at top right, rgba(13, 107, 95, 0.16), transparent 30%),
-    radial-gradient(circle at bottom left, rgba(161, 98, 7, 0.12), transparent 28%),
-    var(--bc-bg);
+  background: var(--bc-bg);
   box-shadow: var(--bc-shadow);
-  backdrop-filter: blur(22px);
   overflow: hidden;
 }
 
 .bc-card[data-access-mode="take_control"] {
   border-color: rgba(73, 148, 255, 0.2);
-  box-shadow: 0 16px 54px rgba(49, 111, 214, 0.12);
 }
 
 .bc-header {
@@ -288,7 +285,6 @@
   border-radius: 16px;
   background: var(--bc-card);
   border: 1px solid rgba(35, 24, 15, 0.07);
-  box-shadow: 0 8px 24px rgba(41, 28, 15, 0.06);
 }
 
 .bc-feed-item-user {
@@ -384,7 +380,6 @@
 
 .bc-composer textarea:focus {
   border-color: rgba(13, 107, 95, 0.32);
-  box-shadow: 0 0 0 3px rgba(13, 107, 95, 0.12);
 }
 
 .bc-send-button {
@@ -514,7 +509,7 @@
     --bc-bg: linear-gradient(180deg, #1f2329 0%, #171a1f 100%);
     --bc-card: rgba(35, 39, 46, 0.94);
     --bc-border: rgba(255, 255, 255, 0.08);
-    --bc-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+    --bc-shadow: none;
     --bc-text: #f1ebe0;
     --bc-muted: #b5aa98;
     --bc-accent-soft: rgba(102, 215, 193, 0.16);

@@ -71,6 +71,7 @@ const NEW_CHAT_ICON = `
 
 type OverlayRefs = {
   shell: HTMLDivElement;
+  clickMarker: HTMLDivElement;
   card: HTMLDivElement;
   connection: HTMLSpanElement;
   taskState: HTMLSpanElement;
@@ -102,6 +103,8 @@ export class OverlayHarness {
   private draftSize: OverlayViewState["size"] | null = null;
   private bootstrapped = false;
   private overlaySuppressed = false;
+  private lastMarkerKey: string | null = null;
+  private markerHideTimer: number | null = null;
 
   constructor(
     private readonly runtime: RuntimeBridge,
@@ -168,6 +171,7 @@ export class OverlayHarness {
     ) {
       this.overlaySuppressed = Boolean((message as { hidden?: boolean }).hidden);
       this.applyOverlaySuppression();
+      await waitForNextPaint(this.win);
       return { ok: true };
     }
 
@@ -243,6 +247,10 @@ export class OverlayHarness {
     shell.className = "bc-shell";
     shell.dir = "ltr";
     shell.innerHTML = `
+      <div class="bc-click-marker" data-visible="false" data-active="false" aria-hidden="true">
+        <div class="bc-click-marker-ring"></div>
+        <div class="bc-click-marker-dot"></div>
+      </div>
       <section class="bc-card" role="dialog" aria-label="BrowserControl overlay">
         <header class="bc-header">
           <div class="bc-header-copy">
@@ -316,6 +324,7 @@ export class OverlayHarness {
     this.createCount += 1;
     this.refs = {
       shell,
+      clickMarker: shell.querySelector(".bc-click-marker") as HTMLDivElement,
       card: shell.querySelector(".bc-card") as HTMLDivElement,
       connection: shell.querySelector(".bc-pill-connection") as HTMLSpanElement,
       taskState: shell.querySelector(".bc-pill-task") as HTMLSpanElement,
@@ -516,9 +525,6 @@ export class OverlayHarness {
   }
 
   private applyOverlaySuppression() {
-    if (this.host) {
-      this.host.style.display = this.overlaySuppressed ? "none" : "block";
-    }
     if (this.refs) {
       this.refs.shell.dataset.suppressed = this.overlaySuppressed ? "true" : "false";
     }
@@ -543,6 +549,7 @@ export class OverlayHarness {
     this.refs.taskState.textContent = formatTaskState(viewState.taskState);
     this.refs.taskState.dataset.state = viewState.taskState;
     this.refs.headerMessage.textContent = viewState.headerMessage ?? "";
+    this.renderLastActionMarker(viewState.lastAction ?? null);
     this.refs.pauseButton.textContent = viewState.taskState === "paused" ? "Resume" : "Pause";
     this.refs.pauseButton.disabled =
       viewState.taskState === "idle" ||
@@ -583,6 +590,56 @@ export class OverlayHarness {
       this.draftPosition ?? viewState.position,
       this.draftSize ?? viewState.size
     );
+  }
+
+  private renderLastActionMarker(lastAction: OverlayViewState["lastAction"]) {
+    if (!this.refs) {
+      return;
+    }
+
+    const marker = this.refs.clickMarker;
+    if (!lastAction?.point) {
+      marker.dataset.visible = "false";
+      marker.dataset.active = "false";
+      if (this.markerHideTimer !== null) {
+        this.win.clearTimeout(this.markerHideTimer);
+        this.markerHideTimer = null;
+      }
+      this.lastMarkerKey = null;
+      return;
+    }
+
+    marker.dataset.visible = "true";
+    marker.style.left = `${Math.round(lastAction.point.x)}px`;
+    marker.style.top = `${Math.round(lastAction.point.y)}px`;
+
+    const markerKey = [
+      lastAction.toolName,
+      lastAction.targetId ?? "",
+      Math.round(lastAction.point.x),
+      Math.round(lastAction.point.y)
+    ].join(":");
+    if (this.lastMarkerKey === markerKey) {
+      return;
+    }
+
+    this.lastMarkerKey = markerKey;
+    marker.dataset.active = "false";
+    void marker.offsetWidth;
+    marker.dataset.active = "true";
+    if (this.markerHideTimer !== null) {
+      this.win.clearTimeout(this.markerHideTimer);
+    }
+    this.win.setTimeout(() => {
+      if (this.refs?.clickMarker === marker) {
+        marker.dataset.active = "false";
+      }
+    }, 450);
+    this.markerHideTimer = this.win.setTimeout(() => {
+      if (this.refs?.clickMarker === marker && this.lastMarkerKey === markerKey) {
+        marker.dataset.visible = "false";
+      }
+    }, 4000);
   }
 
   private renderFeed(feed: OverlayFeedItem[], previousScrollBottom: number) {
@@ -682,17 +739,74 @@ async function sanitizeCapturedImage(
   }
 
   context.drawImage(image, 0, 0);
-  if (overlayBounds && overlayBounds.width > 0 && overlayBounds.height > 0) {
-    context.fillStyle = "#10151d";
-    context.fillRect(
-      Math.round(overlayBounds.x),
-      Math.round(overlayBounds.y),
-      Math.round(overlayBounds.width),
-      Math.round(overlayBounds.height)
-    );
+  void overlayBounds;
+  const markerBounds = getVisibleClickMarkerBounds();
+  if (markerBounds) {
+    paintOverBoundsWithNearbyPixels(context, canvas, markerBounds);
   }
 
   return canvas.toDataURL("image/png");
+}
+
+function getVisibleClickMarkerBounds() {
+  const host = document.getElementById("browsercontrol-host");
+  if (!(host instanceof HTMLDivElement)) {
+    return null;
+  }
+  const marker = host.shadowRoot?.querySelector(".bc-click-marker[data-visible='true']");
+  if (!(marker instanceof HTMLDivElement)) {
+    return null;
+  }
+  const rect = marker.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  return {
+    x: rect.left - 12,
+    y: rect.top - 12,
+    width: rect.width + 24,
+    height: rect.height + 24
+  };
+}
+
+async function waitForNextPaint(win: Window) {
+  await new Promise<void>((resolve) => win.requestAnimationFrame(() => resolve()));
+}
+
+function paintOverBoundsWithNearbyPixels(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  overlayBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }
+) {
+  const x = Math.max(0, Math.round(overlayBounds.x));
+  const y = Math.max(0, Math.round(overlayBounds.y));
+  const width = Math.max(1, Math.min(canvas.width - x, Math.round(overlayBounds.width)));
+  const height = Math.max(1, Math.min(canvas.height - y, Math.round(overlayBounds.height)));
+  const sampleSize = Math.max(12, Math.min(36, Math.round(Math.min(width, height) / 4)));
+
+  if (x - sampleSize >= 0) {
+    context.drawImage(canvas, x - sampleSize, y, sampleSize, height, x, y, width, height);
+    return;
+  }
+  if (x + width + sampleSize <= canvas.width) {
+    context.drawImage(canvas, x + width, y, sampleSize, height, x, y, width, height);
+    return;
+  }
+  if (y - sampleSize >= 0) {
+    context.drawImage(canvas, x, y - sampleSize, width, sampleSize, x, y, width, height);
+    return;
+  }
+  if (y + height + sampleSize <= canvas.height) {
+    context.drawImage(canvas, x, y + height, width, sampleSize, x, y, width, height);
+    return;
+  }
+
+  context.clearRect(x, y, width, height);
 }
 
 function renderFeedItem(doc: Document, item: OverlayFeedItem) {
@@ -751,7 +865,7 @@ function renderModelControls(
       const option = modelSelect.ownerDocument.createElement("option");
       option.value = model.id;
       if (model.id === "auto") {
-        const resolvedId = resolveEffectiveModelId(model.id, effort);
+        const resolvedId = resolveEffectiveModelId(model.id, effort, models);
         const resolvedLabel = models.find((candidate) => candidate.id === resolvedId)?.label ?? resolvedId;
         option.textContent = `${model.label} (${resolvedLabel})`;
       } else {
@@ -761,7 +875,7 @@ function renderModelControls(
     })
   );
   modelSelect.value = selectedModel;
-  const resolvedId = resolveEffectiveModelId(selectedModel, effort);
+  const resolvedId = resolveEffectiveModelId(selectedModel, effort, models);
   const resolvedLabel = models.find((candidate) => candidate.id === resolvedId)?.label ?? resolvedId;
   modelSelect.title =
     selectedModel === "auto" ? `Auto currently uses ${resolvedLabel}` : resolvedLabel;

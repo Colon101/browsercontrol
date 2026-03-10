@@ -17,6 +17,12 @@ import {
 
 export type ModelAdapterEvent =
   | { type: "progress"; sessionId: string; summary: string; raw?: unknown }
+  | {
+      type: "tool_call";
+      sessionId: string;
+      toolName: BrowserToolName;
+      args: Record<string, unknown>;
+    }
   | { type: "error"; sessionId: string; message: string };
 
 export interface ModelSessionConfig {
@@ -103,12 +109,23 @@ const completionResponseSchema = z.object({
     .min(1)
 });
 
+const modelsResponseSchema = z.object({
+  data: z.array(
+    z.object({
+      id: z.string()
+    })
+  )
+});
+
+const EFFORT_SUFFIXES = ["minimal", "low", "medium", "high", "xhigh", "none"];
+
 export class ChatMockModelAdapter implements ModelAdapter {
   private readonly sessions = new Map<string, ChatMockSessionState>();
   private readonly events = new EventEmitter();
   private readonly baseUrl: string;
   private readonly apiKey: string | null;
   private readonly fetchImpl: typeof fetch;
+  private modelsCache: { expiresAt: number; models: ModelDescriptor[] } | null = null;
 
   constructor(options: { baseUrl?: string; apiKey?: string | null; fetchImpl?: typeof fetch } = {}) {
     this.baseUrl =
@@ -125,7 +142,26 @@ export class ChatMockModelAdapter implements ModelAdapter {
   }
 
   async listModels(): Promise<ModelDescriptor[]> {
-    return DEFAULT_MODEL_DESCRIPTORS.map((model) => ({ ...model }));
+    const now = Date.now();
+    if (this.modelsCache && this.modelsCache.expiresAt > now) {
+      return this.modelsCache.models.map((model) => ({ ...model }));
+    }
+
+    try {
+      const models = await this.fetchLiveModels();
+      this.modelsCache = {
+        expiresAt: now + 15_000,
+        models
+      };
+      return models.map((model) => ({ ...model }));
+    } catch {
+      const fallback = DEFAULT_MODEL_DESCRIPTORS.map((model) => ({ ...model }));
+      this.modelsCache = {
+        expiresAt: now + 5_000,
+        models: fallback
+      };
+      return fallback;
+    }
   }
 
   async startSession(config: ModelSessionConfig): Promise<void> {
@@ -189,9 +225,11 @@ export class ChatMockModelAdapter implements ModelAdapter {
   }
 
   private async complete(session: ChatMockSessionState): Promise<ModelTurn> {
+    const availableModels = await this.listModels();
     const model = resolveRequestedModel(
       session.config.task.model,
-      session.config.task.effort
+      session.config.task.effort,
+      availableModels
     );
     const response = await this.fetchImpl(`${this.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -231,6 +269,12 @@ export class ChatMockModelAdapter implements ModelAdapter {
       const turn = parseToolCall(toolCall);
       session.toolCallMap.set(turn.callId, toolCall.id);
       this.emit({
+        type: "tool_call",
+        sessionId: session.config.sessionId,
+        toolName: turn.toolName,
+        args: turn.args
+      });
+      this.emit({
         type: "progress",
         sessionId: session.config.sessionId,
         summary: `${turn.toolName} ${JSON.stringify(turn.args)}`
@@ -257,6 +301,18 @@ export class ChatMockModelAdapter implements ModelAdapter {
 
   private emit(event: ModelAdapterEvent) {
     this.events.emit("event", event);
+  }
+
+  private async fetchLiveModels() {
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/models`, {
+      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : undefined
+    });
+    if (!response.ok) {
+      throw new Error(`ChatMock models request failed with ${response.status}.`);
+    }
+
+    const payload = modelsResponseSchema.parse(await response.json());
+    return buildModelCatalog(payload.data.map((item) => item.id));
   }
 }
 
@@ -363,8 +419,10 @@ function buildSystemPrompt() {
     "You are BrowserControl's decision engine.",
     "You see a screenshot and a compact target map for the current page.",
     "You can either call exactly one tool or provide the final answer.",
-    "Prefer semantic target tools over coordinate clicks.",
-    "Use click_coords only when the screenshot shows a location that is not represented well by a target.",
+    "If a target map entry exists for the element you want, use the target-based tool and pass its targetId.",
+    "Target IDs are valid only for the latest screenshot and target map. After any tool call, use the refreshed IDs you receive next.",
+    "Do not use click_coords for buttons, links, inputs, tabs, or menu items that already appear in the target map.",
+    "Use click_coords only when the screenshot shows a location that is not represented well by any target.",
     "After each tool result you will receive a fresh screenshot and a fresh target map.",
     "Do not ask to open or reason across new tabs. Same-tab navigation is enforced.",
     'If accessMode is "readonly", do not pretend interactions succeeded.',
@@ -396,8 +454,12 @@ async function readImageAsDataUrl(imagePath: string) {
   return `data:image/png;base64,${file.toString("base64")}`;
 }
 
-function resolveRequestedModel(model: string, effort: Effort) {
-  return ModelIdSchema.parse(resolveEffectiveModelId(model, effort));
+function resolveRequestedModel(
+  model: string,
+  effort: Effort,
+  models: ModelDescriptor[]
+) {
+  return ModelIdSchema.parse(resolveEffectiveModelId(model, effort, models));
 }
 
 function normalizeAssistantText(content: string | null | undefined) {
@@ -415,4 +477,68 @@ function summarizeFinalMessage(message: string) {
     .map((item) => item.trim())
     .find(Boolean);
   return line ? line.slice(0, 120) : "Completed";
+}
+
+function buildModelCatalog(modelIds: string[]) {
+  const seen = new Set<string>();
+  const baseModelIds = modelIds
+    .filter((modelId) => {
+      if (seen.has(modelId)) {
+        return false;
+      }
+      seen.add(modelId);
+      return true;
+    })
+    .filter((modelId, _, allIds) => !isReasoningVariantModel(modelId, allIds));
+
+  return [
+    DEFAULT_MODEL_DESCRIPTORS[0],
+    ...baseModelIds.map((modelId) => ({
+      id: modelId,
+      label: formatModelLabel(modelId),
+      supportsEffort: !modelId.endsWith("-mini"),
+      defaultEffort: defaultEffortForModel(modelId)
+    }))
+  ];
+}
+
+function isReasoningVariantModel(modelId: string, allIds: string[]) {
+  const parts = modelId.split("-");
+  const suffix = parts.at(-1);
+  if (!suffix || !EFFORT_SUFFIXES.includes(suffix)) {
+    return false;
+  }
+  const baseId = parts.slice(0, -1).join("-");
+  return allIds.includes(baseId);
+}
+
+function formatModelLabel(modelId: string) {
+  return modelId
+    .split("-")
+    .map((part) => {
+      if (/^gpt$/i.test(part)) {
+        return "GPT";
+      }
+      if (/^codex$/i.test(part)) {
+        return "Codex";
+      }
+      if (/^mini$/i.test(part)) {
+        return "mini";
+      }
+      if (/^max$/i.test(part)) {
+        return "Max";
+      }
+      return /^[0-9.]+$/.test(part) ? part : `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+    })
+    .join(" ");
+}
+
+function defaultEffortForModel(modelId: string): Effort | undefined {
+  if (modelId.endsWith("-mini") || modelId === "codex-mini") {
+    return "low";
+  }
+  if (modelId.includes("codex")) {
+    return "medium";
+  }
+  return "high";
 }

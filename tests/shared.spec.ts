@@ -18,8 +18,27 @@ describe("shared ids and model defaults", () => {
   });
 
   it("maps auto to the effort-specific default model", () => {
-    expect(resolveEffectiveModelId("auto", "high")).toBe("gpt-5.1-codex-max");
-    expect(resolveEffectiveModelId("auto", "medium")).toBe("gpt-5.1-codex");
+    expect(resolveEffectiveModelId("auto", "high")).toBe("gpt-5.3-codex");
+    expect(resolveEffectiveModelId("auto", "medium")).toBe("gpt-5.3-codex");
     expect(resolveEffectiveModelId("auto", "low")).toBe("gpt-5.1-codex-mini");
+  });
+
+  it("falls back to the available live model catalog", () => {
+    expect(
+      resolveEffectiveModelId("auto", "high", [
+        {
+          id: "auto",
+          label: "Auto",
+          supportsEffort: true,
+          defaultEffort: "medium"
+        },
+        {
+          id: "gpt-5.2-codex",
+          label: "GPT-5.2 Codex",
+          supportsEffort: true,
+          defaultEffort: "medium"
+        }
+      ])
+    ).toBe("gpt-5.2-codex");
   });
 });
