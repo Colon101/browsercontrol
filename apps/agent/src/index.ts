@@ -379,8 +379,14 @@ async function buildExtensionRuntime(cwd: string): Promise<ExtensionRuntimeRespo
 
   const [bundleResult, overlayCss] = await Promise.all([
     build({
-      entryPoints: [backgroundRuntimeEntry, runtimeEntry],
+      entryPoints: {
+        "remote-background-entry": backgroundRuntimeEntry,
+        "remote-content-entry": runtimeEntry
+      },
       bundle: true,
+      // esbuild requires outdir for multi-entry in-memory builds even when write=false.
+      outdir: "out",
+      entryNames: "[name]",
       write: false,
       platform: "browser",
       format: "iife",
@@ -688,7 +694,7 @@ async function persistArtifacts(
     return result;
   }
 
-  const taskDir = join(dataDir, "tasks", sessionId);
+  const taskDir = getSessionTaskDir(dataDir, sessionId);
   const file = join(taskDir, `${createIncrementingId("shot")}.png`);
   await mkdir(taskDir, { recursive: true });
   await writeFile(file, Buffer.from(result.screenshotBase64, "base64"));
@@ -709,7 +715,7 @@ async function persistVisualContextArtifacts(
     return context;
   }
 
-  const taskDir = join(dataDir, "tasks", sessionId);
+  const taskDir = getSessionTaskDir(dataDir, sessionId);
   const file = join(taskDir, `${createIncrementingId("shot")}.png`);
   await mkdir(taskDir, { recursive: true });
   await writeFile(file, Buffer.from(context.screenshotBase64, "base64"));
@@ -759,11 +765,31 @@ function truncateForLog(value: string, maxLength: number) {
 }
 
 async function appendRunLog(dataDir: string, sessionId: string, line: string) {
-  const taskDir = join(dataDir, "tasks", sessionId);
+  const taskDir = getSessionTaskDir(dataDir, sessionId);
   await mkdir(taskDir, { recursive: true });
   await writeFile(join(taskDir, "run.log"), `${new Date().toISOString()} ${line}\n`, {
     flag: "a"
   });
+}
+
+function getSessionTaskDir(dataDir: string, sessionId: string) {
+  return join(dataDir, "tasks", safeSessionPathSegment(sessionId));
+}
+
+export function safeSessionPathSegment(sessionId: string) {
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(sessionId)) {
+    return sessionId;
+  }
+
+  const normalized = sessionId
+    .normalize("NFKC")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/^[._-]+/, "")
+    .slice(0, 48);
+  const prefix = normalized.length > 0 ? normalized : "session";
+  const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+
+  return `${prefix}-${digest}`;
 }
 
 async function getNextRunId(dataDir: string) {
